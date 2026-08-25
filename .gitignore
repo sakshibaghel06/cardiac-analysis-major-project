@@ -1,0 +1,35 @@
+# React / Vite
+cardiac/node_modules/
+cardiac/dist/
+cardiac/.vite/
+
+# Environment variables
+cardiac/.env
+cardiac/.env.local
+cardiac/.env.development
+cardiac/.env.production
+
+# Python virtual environment
+cardiac_ml/venv/
+cardiac_ml/.venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python environment files
+.env
+.env.*
+
+# IDE / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Build / cache
+.cache/
