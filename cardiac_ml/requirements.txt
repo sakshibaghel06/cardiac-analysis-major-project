@@ -22,3 +22,13 @@ typing-inspection==0.4.4
 typing_extensions==4.16.0
 tzdata==2026.3
 uvicorn==0.52.4
+
+# ---------------------------------------------------------------------
+# Payments -> Firestore.
+#
+# payments.py imports this lazily. Without it the prediction API still
+# runs, but every payment endpoint returns HTTP 503 rather than
+# recording a payment. Needed for the payment step only.
+# ---------------------------------------------------------------------
+firebase-admin==7.1.0
+

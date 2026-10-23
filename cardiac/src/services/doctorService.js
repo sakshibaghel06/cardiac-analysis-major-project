@@ -5,49 +5,93 @@ import {
   where,
 } from "firebase/firestore";
 
+import { doc, getDoc } from "firebase/firestore";
+
 import { db } from "../firebase/firebase";
+
+/*
+====================================================
+DOCTOR IDENTITY
+====================================================
+
+A Firebase Auth uid is 28 characters of [A-Za-z0-9].
+An auto-generated Firestore document id is 20.
+
+That distinction matters because the doctors collection
+was populated inconsistently: some documents are keyed
+by the doctor's Auth uid, others by an auto id. Only the
+uid-keyed ones can ever be matched to a signed-in doctor.
+
+The authoritative link is the `uid` FIELD. The document
+id is only trusted when it is already uid-shaped.
+*/
+
+export const isAuthUid = (id) =>
+  typeof id === "string" && /^[A-Za-z0-9]{28}$/.test(id);
+
+/*
+The uid to use when referring to this doctor from a
+consultation request, a care link or a security rule.
+Returns null when the record has no Auth account behind
+it, which means no one can log in as that doctor.
+*/
+export const doctorUidOf = (doctor) => {
+  if (!doctor) return null;
+  if (doctor.uid) return doctor.uid;
+  if (isAuthUid(doctor.id)) return doctor.id;
+  return null;
+};
 
 /*
 ====================================================
 GET DOCTOR PROFILE
 ====================================================
 
-The logged-in Firebase doctor gives us their email.
+Resolution order:
 
-We search Firestore:
-doctors
-   ↓
-email
-   ↓
-doctor profile
+  1. doctors/{uid}            - the intended convention
+  2. where uid == <uid>       - explicitly linked record
+  3. where email == <email>   - legacy records
+
+Looking up by uid first means a doctor whose document is
+correctly keyed costs one read instead of a query, and
+works even if their email changes.
 */
 
-export const getDoctorProfile = async (email) => {
+export const getDoctorProfile = async (uid, email) => {
   try {
-    const doctorsRef = collection(db, "doctors");
+    // 1. direct hit on the conventional path
+    if (uid) {
+      const direct = await getDoc(doc(db, "doctors", uid));
 
-    const q = query(
-      doctorsRef,
-      where("email", "==", email)
-    );
+      if (direct.exists()) {
+        return { id: direct.id, ...direct.data() };
+      }
 
-    const snapshot = await getDocs(q);
+      // 2. explicitly linked via the uid field
+      const linked = await getDocs(
+        query(collection(db, "doctors"), where("uid", "==", uid))
+      );
 
-    if (snapshot.empty) {
-      return null;
+      if (!linked.empty) {
+        return { id: linked.docs[0].id, ...linked.docs[0].data() };
+      }
     }
 
-    const doctorDoc = snapshot.docs[0];
+    // 3. legacy: match on email
+    if (email) {
+      const byEmail = await getDocs(
+        query(collection(db, "doctors"), where("email", "==", email))
+      );
 
-    return {
-      id: doctorDoc.id,
-      ...doctorDoc.data(),
-    };
+      if (!byEmail.empty) {
+        return { id: byEmail.docs[0].id, ...byEmail.docs[0].data() };
+      }
+    }
+
+    return null;
   } catch (error) {
-    console.error(
-      "Error fetching doctor profile:",
-      error
-    );
+    console.error("Error fetching doctor profile:", error);
 
     throw error;
   }
@@ -231,4 +275,152 @@ export const getDoctorsByCity = async (
 
     throw error;
   }
+};
+
+/*
+====================================================
+DOCTOR WORKSPACE DATA
+====================================================
+
+Everything the doctor dashboard renders, fetched from
+Firestore. No counts are typed in - every number shown
+is derived from the documents actually returned.
+
+Access model: a doctor reaches a patient ONLY through a
+consultation request naming them, and a care link created
+when they accept. There is no query anywhere that returns
+"all patients".
+====================================================
+*/
+
+const toMillis = (value) => {
+  if (!value) return 0;
+  if (typeof value.toMillis === "function") return value.toMillis();
+  return new Date(value).getTime() || 0;
+};
+
+const newestFirst = (a, b) => toMillis(b.createdAt) - toMillis(a.createdAt);
+
+/*
+Every consultation request addressed to this doctor.
+Status is lowercased on read because some legacy records
+were written as "PENDING", which the dashboard's
+status === "pending" filter silently ignored.
+*/
+export const getDoctorConsultations = async (doctorUid) => {
+  if (!doctorUid) return [];
+
+  const snapshot = await getDocs(
+    query(
+      collection(db, "consultation_requests"),
+      where("doctorId", "==", doctorUid)
+    )
+  );
+
+  return snapshot.docs
+    .map((docSnapshot) => {
+      const data = docSnapshot.data();
+
+      return {
+        id: docSnapshot.id,
+        ...data,
+        status: String(data.status || "pending").toLowerCase(),
+      };
+    })
+    .sort(newestFirst);
+};
+
+/*
+The doctor's patient list, derived from their own
+consultations rather than from a patients collection -
+which is why a doctor can never see an unrelated patient.
+
+One entry per patient, carrying their most recent
+consultation and how many they have had.
+*/
+export const getDoctorPatients = (consultations) => {
+  const byPatient = new Map();
+
+  consultations.forEach((consultation) => {
+    const key = consultation.patientId;
+
+    if (!key) return;
+
+    const existing = byPatient.get(key);
+
+    if (!existing) {
+      byPatient.set(key, {
+        patientId: key,
+        name: consultation.patientName || "Patient",
+        email: consultation.patientEmail || "",
+        latestRisk: consultation.risk || null,
+        latestStatus: consultation.status,
+        latestAt: consultation.createdAt,
+        total: 1,
+        // Only an accepted consultation grants access to records.
+        hasAccess: ["accepted", "completed"].includes(consultation.status),
+      });
+
+      return;
+    }
+
+    existing.total += 1;
+
+    if (["accepted", "completed"].includes(consultation.status)) {
+      existing.hasAccess = true;
+    }
+
+    // consultations arrive newest-first, so the first one wins.
+  });
+
+  return [...byPatient.values()];
+};
+
+/*
+Prescriptions this doctor has issued.
+*/
+export const getDoctorPrescriptions = async (doctorUid) => {
+  if (!doctorUid) return [];
+
+  const snapshot = await getDocs(
+    query(collection(db, "prescriptions"), where("doctorId", "==", doctorUid))
+  );
+
+  return snapshot.docs
+    .map((docSnapshot) => ({ id: docSnapshot.id, ...docSnapshot.data() }))
+    .sort(newestFirst);
+};
+
+/*
+Risk assessments belonging to this doctor's patients.
+
+Read one patient at a time rather than as a single query,
+because the security rules authorise per patient via a
+care link - there is no query that could return them all.
+
+A refusal for one patient is not an error: it means the
+care link is gone, so that patient is skipped.
+*/
+export const getDoctorRiskAssessments = async (patientIds) => {
+  const results = await Promise.all(
+    patientIds.map(async (patientId) => {
+      try {
+        const snapshot = await getDocs(
+          query(
+            collection(db, "risk_assessments"),
+            where("uid", "==", patientId)
+          )
+        );
+
+        return snapshot.docs.map((docSnapshot) => ({
+          id: docSnapshot.id,
+          ...docSnapshot.data(),
+        }));
+      } catch {
+        return [];
+      }
+    })
+  );
+
+  return results.flat().sort(newestFirst);
 };

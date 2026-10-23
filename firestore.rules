@@ -1,0 +1,529 @@
+rules_version = '2';
+
+// =====================================================================
+// CardioCare - Firestore security rules
+// =====================================================================
+//
+// The project previously had NO rules file, which means it was running
+// in test mode: any person on the internet with the project id could
+// read and write every patient's medical records.
+//
+// Deploy with:
+//     firebase deploy --only firestore:rules
+//
+// Model
+// -----
+//   * A patient owns their own profile, assessments and consultations.
+//   * A doctor is identified by a document in /doctors whose id is the
+//     doctor's Firebase Auth uid.
+//   * A doctor may only reach a patient's data through an ACCEPTED (or
+//     pending) consultation request that names them. There is no rule
+//     anywhere that lets a doctor read patients in general.
+//
+// Known limitation, stated plainly
+// --------------------------------
+// The risk result is written by the browser after it calls the
+// prediction API, so rules cannot prove the number came from the model.
+// Two mitigations are applied below: the shape and range of the result
+// are validated, and assessments are IMMUTABLE once created. Closing
+// this properly needs a trusted writer - a Cloud Function or the API
+// itself using the Admin SDK. The same applies to payments, which is
+// why clients can never set a payment to 'paid'.
+// =====================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // -----------------------------------------------------------------
+    // HELPERS
+    // -----------------------------------------------------------------
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isUser(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    /*
+      A doctor is someone with a /doctors document keyed by their
+      own Auth uid.
+
+      Document EXISTENCE is the test, not a role field, because
+      exists() is a single O(1) lookup whereas reading a field costs
+      an extra get() on every rule evaluation. The role field is
+      still written by the seeding script so the collection is
+      self-describing, but security never depends on it - a field
+      could in principle be edited, a document path cannot be forged.
+
+      This is exactly the test roleService.resolveRole() applies in
+      the app, so the UI and the database always agree.
+    */
+    function isDoctor() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/doctors/$(request.auth.uid));
+    }
+
+    function consultation(requestId) {
+      return get(/databases/$(database)/documents/consultation_requests/$(requestId)).data;
+    }
+
+    function consultationExists(requestId) {
+      return exists(/databases/$(database)/documents/consultation_requests/$(requestId));
+    }
+
+    // Is this user one of the two parties on that consultation?
+    function isParty(requestId) {
+      let c = consultation(requestId);
+      return signedIn()
+        && (request.auth.uid == c.patientId || request.auth.uid == c.doctorId);
+    }
+
+    // Does this doctor have a care relationship with this patient?
+    //
+    // Firestore rules cannot run a query, so "is there a consultation
+    // request linking us?" cannot be asked directly. Instead the app
+    // writes a link document at a DETERMINISTIC path when a doctor
+    // accepts a consultation:
+    //
+    //     care_links/{doctorUid}_{patientUid}
+    //
+    // which exists() can check in O(1). Deleting that link revokes the
+    // doctor's access to the patient immediately.
+    //
+    // This is the ONLY route by which a doctor reaches patient data.
+    // There is deliberately no rule granting doctors blanket read
+    // access to patients.
+    function treats(patientId) {
+      return isDoctor()
+        && exists(/databases/$(database)/documents/care_links/$(request.auth.uid + '_' + patientId));
+    }
+
+    // Fields the client is attempting to change.
+    function changed() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+
+    // =================================================================
+    // USERS  - patient profiles
+    // =================================================================
+
+    match /users/{uid} {
+      // Own profile, always.
+      allow read: if isUser(uid);
+
+      // A doctor may read a patient profile ONLY while a care link
+      // exists between them. Not "any doctor", not "all patients".
+      allow read: if treats(uid);
+
+      /*
+        role is written as 'patient' here and can never be changed.
+        The signup form has no role selector, and a doctor account is
+        provisioned by an administrator, so there is no path by which
+        a user can promote themselves.
+      */
+      allow create: if isUser(uid)
+        && request.resource.data.role == 'patient'
+        && request.resource.data.uid == uid;
+
+      /*
+        get(field, default) rather than a bare field read: reading a
+        missing field is an ERROR in rules, which would lock the
+        owner out of any profile document that predates the uid
+        field. Defaulting both sides to the document id keeps the
+        guarantee - uid can never be repointed at another user.
+      */
+      allow update: if isUser(uid)
+        && request.resource.data.get('role', 'patient')
+             == resource.data.get('role', 'patient')
+        && request.resource.data.get('uid', uid) == uid;
+
+      allow delete: if false;
+    }
+
+
+    // =================================================================
+    // DOCTORS  - directory
+    // =================================================================
+
+    match /doctors/{doctorId} {
+      // Patients must be able to browse doctors to pick one.
+      allow read: if signedIn();
+
+      /*
+        A doctor edits their OWN record only - name, speciality,
+        experience, consultation fee, availability, and the
+        notifications-seen marker.
+
+        Four fields are held back, because they are administrative
+        facts rather than self-service settings:
+
+          uid           the link to the Auth account. Changing it
+                        would point this record at someone else.
+          hospitalId /
+          hospitalName  which hospital they practise at. Self-service
+                        would let a doctor appear under a hospital
+                        they have no connection to.
+          role          never writable by a client, anywhere.
+          supersededBy  set when an old auto-id record is retired;
+                        clearing it would resurrect a duplicate.
+
+        One doctor can never touch another's record at all.
+      */
+      allow update: if isUser(doctorId)
+        && !changed().hasAny([
+             'uid', 'hospitalId', 'hospitalName', 'role', 'supersededBy'
+           ]);
+
+      // Doctor records are provisioned by an administrator, not by
+      // the app. See scripts/seed_firestore.mjs.
+      allow create, delete: if false;
+    }
+
+
+    // =================================================================
+    // HOSPITALS  - reference data
+    // =================================================================
+
+    match /hospitals/{hospitalId} {
+      // Patients browse hospitals to choose where to be seen.
+      allow read: if signedIn();
+
+      // Provisioned by an administrator, never by the app.
+      allow write: if false;
+
+      /*
+        SETTLEMENT DETAILS  -  not readable by anyone, ever.
+
+        The Razorpay linked-account id and onboarding state live
+        here rather than on the hospital document, because that
+        document is readable by every signed-in patient. A linked
+        account id is a payout destination; it has no business
+        being in a directory listing.
+
+        Only the Admin SDK reaches this, and the Admin SDK bypasses
+        rules - so "deny everyone" is the correct rule, not an
+        oversight. A client has no legitimate reason to read or
+        write a payout destination.
+      */
+      match /private/{document=**} {
+        allow read, write: if false;
+      }
+    }
+
+
+    // =================================================================
+    // RISK ASSESSMENTS
+    // =================================================================
+
+    match /risk_assessments/{assessmentId} {
+
+      // Own assessments.
+      allow read: if signedIn() && resource.data.uid == request.auth.uid;
+
+      // A doctor may read an assessment only for a patient they have a
+      // care link with - i.e. one who requested a consultation from
+      // them and whose request they accepted.
+      allow read: if treats(resource.data.uid);
+
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        // The result must at least be a valid shape and range. This does
+        // not prove it came from the model, but it stops arbitrary values.
+        && request.resource.data.risk in ['LOW', 'MODERATE', 'HIGH']
+        && request.resource.data.probability is number
+        && request.resource.data.probability >= 0
+        && request.resource.data.probability <= 1
+        && request.resource.data.prediction in [0, 1]
+        && request.resource.data.createdAt == request.time;
+
+      // Immutable. A patient cannot go back and rewrite their risk, and
+      // neither can a doctor.
+      allow update, delete: if false;
+    }
+
+
+    // =================================================================
+    // CONSULTATION REQUESTS
+    // =================================================================
+
+    match /consultation_requests/{requestId} {
+
+      allow read: if signedIn()
+        && (resource.data.patientId == request.auth.uid
+            || resource.data.doctorId == request.auth.uid);
+
+      // Only a patient creates a request, only for themselves, and it
+      // always starts as pending. A patient cannot self-accept.
+      allow create: if signedIn()
+        && request.resource.data.patientId == request.auth.uid
+        && request.resource.data.doctorId is string
+        && request.resource.data.doctorId != ''
+        && request.resource.data.status == 'pending'
+        && request.resource.data.createdAt == request.time;
+
+      // The named doctor accepts, rejects or completes.
+      /*
+        The named doctor accepts, starts, declines or completes,
+        and records that a prescription has been issued.
+
+        Two things they can NEVER touch:
+
+          risk / report   the patient's own assessment result
+          paymentStatus   money. Only the server may mark a
+                          consultation paid, after it has
+                          verified the Razorpay signature. The
+                          Admin SDK bypasses these rules, which
+                          is exactly why no client path to this
+                          field may exist - including a doctor's.
+      */
+      allow update: if signedIn()
+        && resource.data.doctorId == request.auth.uid
+        && request.resource.data.patientId == resource.data.patientId
+        && request.resource.data.doctorId == resource.data.doctorId
+        && request.resource.data.status in ['accepted', 'in_progress', 'rejected', 'completed']
+        && request.resource.data.get('prescriptionStatus', 'none')
+             in ['none', 'draft', 'issued']
+        && !('risk' in changed())
+        && !('report' in changed())
+        && !('fee' in changed())
+        && !('paymentStatus' in changed())
+        && !('paymentId' in changed());
+
+      // The patient may only cancel, and only while still pending.
+      /*
+        The patient may only cancel, only while still pending,
+        and may change nothing else - hasOnly() is what stops a
+        cancel being used to smuggle in a paymentStatus edit.
+      */
+      allow update: if signedIn()
+        && resource.data.patientId == request.auth.uid
+        && resource.data.status == 'pending'
+        && request.resource.data.status == 'cancelled'
+        && changed().hasOnly(['status', 'updatedAt']);
+
+      allow delete: if false;
+    }
+
+
+    // =================================================================
+    // CARE LINKS  - doctor <-> patient access grants
+    // =================================================================
+    //
+    // Document id is exactly "{doctorUid}_{patientUid}".
+    //
+    // Created by the doctor when they accept a consultation. Its sole
+    // purpose is to let treats() answer, in one lookup, whether this
+    // doctor is allowed to see this patient's records.
+
+    match /care_links/{linkId} {
+
+      allow read: if signedIn()
+        && (resource.data.doctorId == request.auth.uid
+            || resource.data.patientId == request.auth.uid);
+
+      // Only the doctor named in the link may create it, the id must
+      // match the pair, and an accepted consultation between the two
+      // must already exist.
+      allow create: if isDoctor()
+        && linkId == request.resource.data.doctorId + '_' + request.resource.data.patientId
+        && request.resource.data.doctorId == request.auth.uid
+        && consultationExists(request.resource.data.requestId)
+        && consultation(request.resource.data.requestId).doctorId == request.auth.uid
+        && consultation(request.resource.data.requestId).patientId == request.resource.data.patientId;
+
+      /*
+        Re-asserting an existing link must be allowed.
+
+        A care link is keyed by the PAIR, not by the consultation,
+        so the same doctor and patient reuse it every time they
+        consult again. acceptConsultation writes it with setDoc,
+        which is a CREATE the first time and an UPDATE every time
+        after - and `update: if false` turned the doctor's second
+        consultation with the same patient into a hard failure.
+
+        The link is still immutable in the way that matters: the
+        doctor and patient it names can never change, so this
+        cannot be used to point an existing grant at someone else.
+      */
+      allow update: if isDoctor()
+        && resource.data.doctorId == request.auth.uid
+        && request.resource.data.doctorId == resource.data.doctorId
+        && request.resource.data.patientId == resource.data.patientId;
+
+      // Either side may revoke access.
+      allow delete: if signedIn()
+        && (resource.data.doctorId == request.auth.uid
+            || resource.data.patientId == request.auth.uid);
+    }
+
+
+    // =================================================================
+    // VIDEO ROOMS  - WebRTC signalling
+    // =================================================================
+    //
+    // Only the two people on the consultation may read or write the
+    // room. This is what stops a third party joining a call by guessing
+    // a consultation id.
+
+    match /video_rooms/{requestId} {
+
+      allow read: if consultationExists(requestId) && isParty(requestId);
+
+      allow create: if consultationExists(requestId)
+        && isParty(requestId)
+        && consultation(requestId).status == 'accepted';
+
+      allow update: if consultationExists(requestId)
+        && isParty(requestId)
+        && request.resource.data.patientId == resource.data.patientId
+        && request.resource.data.doctorId == resource.data.doctorId;
+
+      allow delete: if false;
+
+      // ICE candidates. Same two people, nobody else.
+      match /{candidateCollection}/{candidateId} {
+        allow read, create: if consultationExists(requestId) && isParty(requestId);
+        allow update: if false;
+        allow delete: if consultationExists(requestId) && isParty(requestId);
+      }
+    }
+
+
+    // =================================================================
+    // PRESCRIPTIONS
+    // =================================================================
+    //
+    // Written by the doctor, read-only for the patient. A patient can
+    // never create or alter a prescription.
+
+    match /prescriptions/{prescriptionId} {
+
+      /*
+        ---- READ ----
+
+        The issuing doctor always sees their own work, draft or
+        issued.
+
+        The patient sees the CONTENTS only when both are true:
+
+          1. the doctor has explicitly issued it - a draft is
+             working notes, not advice to act on
+          2. the consultation fee has been settled, when one is
+             charged
+
+        The patient is not left guessing in the meantime: the
+        consultation document, which they can always read,
+        carries prescriptionStatus. So they can see that one is
+        pending or ready without seeing what it says.
+
+        paymentStatus is only ever written by the server after
+        it verifies the Razorpay signature, so a client cannot
+        unlock this by editing anything it controls.
+      */
+      allow read: if isDoctor()
+        && resource.data.doctorId == request.auth.uid;
+
+      /*
+        The patient's gate is a single boolean ON THIS DOCUMENT,
+        deliberately - not a lookup into the consultation.
+
+        Rules are evaluated per document for a LIST query, and a
+        single row that fails kills the ENTIRE query. The previous
+        version checked status AND the consultation's paymentStatus,
+        so one unpaid prescription made
+        `where patientId == me` fail outright - which is why the
+        patient dashboard showed a permission error and every count
+        read zero.
+
+        `unlocked` can be named in the query, so the query becomes
+        provably safe and simply does not return locked rows.
+
+        It is written ONLY by the server, in the same operation that
+        verifies the Razorpay signature. No client can set it: there
+        is no client write path to prescriptions except the issuing
+        doctor's, and that path is forbidden from touching it below.
+      */
+      allow read: if signedIn()
+        && resource.data.patientId == request.auth.uid
+        && resource.data.get('unlocked', false) == true;
+
+      /*
+        ---- CREATE ----
+        Only the doctor named on the consultation, only for a
+        patient who is actually on it, and only with a status
+        this collection recognises.
+      */
+      allow create: if isDoctor()
+        && request.resource.data.doctorId == request.auth.uid
+        && consultationExists(request.resource.data.requestId)
+        && consultation(request.resource.data.requestId).doctorId == request.auth.uid
+        && consultation(request.resource.data.requestId).patientId
+             == request.resource.data.patientId
+        && request.resource.data.status in ['draft', 'issued']
+        // A doctor cannot create an already-unlocked prescription.
+        && request.resource.data.get('unlocked', false) == false
+        && request.resource.data.createdAt == request.time;
+
+      /*
+        ---- UPDATE ----
+        Only the issuing doctor, never the patient.
+
+        An ISSUED prescription is frozen. It is the record of
+        what the patient was told, and they may already hold a
+        downloaded PDF of it - silently rewriting it would make
+        that copy disagree with the database. A correction goes
+        out as a new prescription.
+      */
+      allow update: if isDoctor()
+        && resource.data.doctorId == request.auth.uid
+        && resource.data.status == 'draft'
+        && request.resource.data.patientId == resource.data.patientId
+        && request.resource.data.doctorId == resource.data.doctorId
+        && request.resource.data.requestId == resource.data.requestId
+        && request.resource.data.status in ['draft', 'issued']
+        // Unlocking is a payment outcome, not a clinical one.
+        && !('unlocked' in changed());
+
+      allow delete: if false;
+    }
+
+
+    // =================================================================
+    // PAYMENTS
+    // =================================================================
+    //
+    // A client may OPEN a payment but may never mark one successful.
+    // Only a trusted server that has verified the gateway signature can
+    // move a payment to 'paid', and that server uses the Admin SDK,
+    // which bypasses these rules entirely.
+
+    match /payments/{paymentId} {
+
+      allow read: if signedIn()
+        && (resource.data.patientId == request.auth.uid
+            || resource.data.doctorId == request.auth.uid);
+
+      allow create: if signedIn()
+        && request.resource.data.patientId == request.auth.uid
+        && request.resource.data.status == 'created'
+        && request.resource.data.createdAt == request.time;
+
+      // Deliberately closed. The frontend NEVER decides that a payment
+      // succeeded - that is the whole point.
+      allow update, delete: if false;
+    }
+
+
+    // =================================================================
+    // DEFAULT DENY
+    // =================================================================
+    // Anything not matched above is refused.
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

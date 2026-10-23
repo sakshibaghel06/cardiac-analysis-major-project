@@ -1,0 +1,90 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- =====================================================
+         PERMISSIONS
+         =====================================================
+
+         Video consultation needs camera and microphone. On
+         Android 6.0 and above these are RUNTIME permissions:
+         declaring them here is necessary but NOT sufficient,
+         the app must also request them at the moment of use.
+         That happens in lib/services/video_room_service.dart.
+
+         A missing entry here is a silent failure - the runtime
+         request is refused immediately without ever showing the
+         user a dialog, which looks exactly like the user having
+         denied it. That class of bug is why this file is
+         explicit and commented.
+         ===================================================== -->
+
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.CAMERA"/>
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+
+    <!-- WebRTC adjusts audio routing (earpiece / speaker) and needs
+         to know whether the network is usable. -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+
+    <!-- Bluetooth headsets during a consultation. Android 12+ uses
+         BLUETOOTH_CONNECT; older releases use BLUETOOTH. -->
+    <uses-permission android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30"/>
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT"/>
+
+    <!-- Keeps the call alive when the screen turns off. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+
+    <!-- The app works without a camera (audio-only fallback), so
+         these must not be hard requirements or the Play Store would
+         hide the app from tablets that lack one. -->
+    <uses-feature android:name="android.hardware.camera"
+        android:required="false"/>
+    <uses-feature android:name="android.hardware.camera.autofocus"
+        android:required="false"/>
+    <uses-feature android:name="android.hardware.microphone"
+        android:required="false"/>
+
+    <application
+        android:label="CardioCare"
+        android:name="${applicationName}"
+        android:icon="@mipmap/ic_launcher">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:taskAffinity=""
+            android:theme="@style/LaunchTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+            <meta-data
+              android:name="io.flutter.embedding.android.NormalTheme"
+              android:resource="@style/NormalTheme"
+              />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+
+        <meta-data
+            android:name="flutterEmbedding"
+            android:value="2" />
+    </application>
+
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.PROCESS_TEXT"/>
+            <data android:mimeType="text/plain"/>
+        </intent>
+
+        <!-- Emergency support: dialling local emergency services. -->
+        <intent>
+            <action android:name="android.intent.action.DIAL"/>
+            <data android:scheme="tel"/>
+        </intent>
+    </queries>
+</manifest>

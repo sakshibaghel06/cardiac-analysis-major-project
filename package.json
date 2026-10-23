@@ -1,0 +1,7 @@
+{
+  "name": "cardiac-analysis",
+  "private": true,
+  "scripts": {
+    "test:rules": "firebase emulators:exec --only firestore --project cardiac-analysis-rules-test \"node tests/rules.test.mjs\""
+  }
+}

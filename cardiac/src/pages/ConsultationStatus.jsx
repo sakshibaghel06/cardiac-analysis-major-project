@@ -12,6 +12,15 @@ import {
 
 import { db } from "../firebase/firebase";
 
+import {
+  STATUS,
+  isJoinable,
+  joinLabel,
+  normaliseStatus,
+  statusHelp,
+  statusLabel,
+} from "../services/consultationService";
+
 function ConsultationStatus() {
   const location = useLocation();
   const navigate = useNavigate();
@@ -21,9 +30,15 @@ function ConsultationStatus() {
   // GET DATA FROM NAVIGATION
   // =====================================================
 
+  /*
+    risk used to default to the literal "MEDIUM" here, so opening
+    this page directly displayed a fabricated risk level next to a
+    real consultation. It now stays null until the actual value
+    arrives from the consultation document below.
+  */
   const {
     requestId: stateRequestId = "",
-    risk = "MEDIUM",
+    risk = null,
     doctor: initialDoctor = {},
     hospital: initialHospital = {},
     city: initialCity = "",
@@ -87,15 +102,16 @@ function ConsultationStatus() {
       "================================="
     );
 
+    /*
+      A missing requestId means this route was reached with a bad
+      URL. Returning early avoids a synchronous setState in the
+      effect body; the render below already treats "no request"
+      as the not-found state.
+    */
     if (!requestId) {
+      console.error("No consultation request id in the URL");
 
-      console.error(
-        "NO REQUEST ID FOUND"
-      );
-
-      setLoading(false);
-
-      return;
+      return undefined;
     }
 
     const requestRef = doc(
@@ -302,31 +318,37 @@ function ConsultationStatus() {
   // STATUS
   // =====================================================
 
-  let statusTitle =
-    "PENDING";
+  /*
+    These used to be an if-chain over "accepted" and "rejected",
+    defaulting to PENDING.
 
-  let statusMessage =
-    "Waiting for the doctor to review your request.";
+    That default was the bug the patient saw. When the doctor joined
+    the call the consultation moved to "in_progress" - a status this
+    page had never heard of - so no branch matched and it fell back
+    to "PENDING". The doctor had not un-accepted anything and the
+    database still said in_progress; only this page misread it.
 
-  if (status === "accepted") {
+    The labels now come from consultationService, which is also what
+    sets the status in the first place, so a status cannot exist
+    without a label here.
+  */
+  const statusTitle = statusLabel(status).toUpperCase();
+  const statusMessage = statusHelp(status);
 
-    statusTitle =
-      "ACCEPTED";
+  /* accepted and in_progress are both joinable - see isJoinable. */
+  const canJoin = isJoinable(status);
 
-    statusMessage =
-      "Your doctor has accepted the consultation request.";
+  const isRejected = normaliseStatus(status) === STATUS.REJECTED;
 
-  }
+  const live = normaliseStatus(status) === STATUS.IN_PROGRESS;
 
-  if (status === "rejected") {
-
-    statusTitle =
-      "REJECTED";
-
-    statusMessage =
-      "The doctor has declined this consultation request.";
-
-  }
+  /* One palette keyed by state, rather than nested ternaries that
+     each had to be remembered separately. */
+  const tone = canJoin
+    ? { background: "#e3f8ef", accent: "#42c59b" }
+    : isRejected
+    ? { background: "#ffe8e8", accent: "#e66b6b" }
+    : { background: "#fff4df", accent: "#f4b04f" };
 
   // =====================================================
   // LOADING
@@ -394,10 +416,13 @@ function ConsultationStatus() {
 
         <h1>
 
-          {status === "accepted"
+          {live
+            ? "Consultation In Progress"
+
+            : canJoin
             ? "Consultation Accepted"
 
-            : status === "rejected"
+            : isRejected
             ? "Consultation Request Declined"
 
             : "Request Sent Successfully"}
@@ -406,11 +431,11 @@ function ConsultationStatus() {
 
         <p>
 
-          {status === "accepted"
+          {canJoin
 
-            ? "Your doctor has accepted your consultation request. You can now join the consultation."
+            ? statusHelp(status)
 
-            : status === "rejected"
+            : isRejected
 
             ? "The selected doctor has declined this consultation request."
 
@@ -428,23 +453,8 @@ function ConsultationStatus() {
       <section
         className="consult-risk-card"
         style={{
-          background:
-            status === "accepted"
-              ? "#e3f8ef"
-
-              : status === "rejected"
-              ? "#ffe8e8"
-
-              : "#fff4df",
-
-          borderLeft:
-            status === "accepted"
-              ? "10px solid #42c59b"
-
-              : status === "rejected"
-              ? "10px solid #e66b6b"
-
-              : "10px solid #f4b04f",
+          background: tone.background,
+          borderLeft: `10px solid ${tone.accent}`,
         }}
       >
 
@@ -624,7 +634,7 @@ function ConsultationStatus() {
                 </strong>
 
                 <span>
-                  {currentRisk}
+                  {currentRisk || "Not recorded"}
                 </span>
 
               </div>
@@ -667,20 +677,34 @@ function ConsultationStatus() {
           ACCEPTED
       ================================================= */}
 
-      {status === "accepted" && (
+      {/*
+          Gated on canJoin, NOT on status === "accepted".
+
+          The literal comparison was what made the Join button
+          disappear the moment the doctor joined: the consultation
+          became "in_progress" and this block stopped rendering, so
+          the patient was locked out of a call that was running and
+          waiting for them.
+      */}
+      {canJoin && (
 
         <section className="consult-submit">
 
           <div>
 
             <strong>
-              Your doctor is ready
+              {live
+                ? "Your doctor is waiting in the consultation room"
+                : "Your doctor is ready"}
             </strong>
 
             <p>
-              {doctorName} has accepted your
-              consultation request. You can now
-              join the video consultation.
+              {live
+                ? `${doctorName} has already joined. Join now to start
+                   your consultation.`
+                : `${doctorName} has accepted your consultation
+                   request. You can now join the video
+                   consultation.`}
             </p>
 
           </div>
@@ -689,7 +713,7 @@ function ConsultationStatus() {
             type="button"
             onClick={() =>
                         navigate(
-            `/video-consultation/${requestId}?role=patient`,
+            `/video-consultation/${requestId}`,
             {
               state: {
                 doctor,
@@ -701,7 +725,7 @@ function ConsultationStatus() {
           )
             }
           >
-            Join Video Consultation →
+            {joinLabel(status)} →
           </button>
 
         </section>
@@ -713,7 +737,7 @@ function ConsultationStatus() {
           PENDING
       ================================================= */}
 
-      {status === "pending" && (
+      {normaliseStatus(status) === STATUS.PENDING && (
 
         <section className="consult-submit">
 
@@ -754,7 +778,7 @@ function ConsultationStatus() {
           REJECTED
       ================================================= */}
 
-      {status === "rejected" && (
+      {isRejected && (
 
         <section className="consult-submit">
 

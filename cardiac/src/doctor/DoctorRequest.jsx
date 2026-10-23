@@ -2,13 +2,16 @@ import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 
 import {
-  doc,
-  getDoc,
-  updateDoc,
-  serverTimestamp,
-} from "firebase/firestore";
-
-import { db } from "../firebase/firebase";
+  STATUS,
+  acceptConsultation,
+  rejectConsultation,
+  getConsultationRequest,
+  isJoinable,
+  joinLabel,
+  normaliseStatus,
+  statusHelp,
+  statusLabel,
+} from "../services/consultationService";
 
 function DoctorRequest() {
   const { requestId } = useParams();
@@ -17,6 +20,7 @@ function DoctorRequest() {
   const [request, setRequest] = useState(null);
   const [loading, setLoading] = useState(true);
   const [updating, setUpdating] = useState(false);
+  const [actionError, setActionError] = useState("");
 
   // =====================================================
   // LOAD CONSULTATION REQUEST
@@ -30,39 +34,23 @@ function DoctorRequest() {
           return;
         }
 
-        const requestRef = doc(
-          db,
-          "consultation_requests",
-          requestId
-        );
+        /*
+          getConsultationRequest lowercases the status on the way
+          out. Some existing records were saved as "PENDING", and
+          the accept/reject buttons below only render for
+          status === "pending", so without this those requests
+          could never be actioned.
+        */
+        const data = await getConsultationRequest(requestId);
 
-        const snapshot = await getDoc(requestRef);
-
-        if (!snapshot.exists()) {
-          console.error(
-            "Consultation request not found"
-          );
+        if (!data) {
+          console.error("Consultation request not found");
 
           setRequest(null);
           return;
         }
 
-        const data = snapshot.data();
-
-        console.log(
-          "FULL CONSULTATION REQUEST:",
-          data
-        );
-
-        console.log(
-          "REPORT FROM FIREBASE:",
-          data.report
-        );
-
-        setRequest({
-          id: snapshot.id,
-          ...data,
-        });
+        setRequest(data);
 
       } catch (error) {
         console.error(
@@ -82,57 +70,96 @@ function DoctorRequest() {
   // UPDATE REQUEST STATUS
   // =====================================================
 
-  const updateRequestStatus = async (status) => {
+  /*
+    `nextStatus` is the status the doctor is MOVING TO. It used to be
+    called `status`, which shadowed the render-scope `status` holding
+    the stored value - the two mean opposite things, and a parameter
+    that silently hides the stored status is how the in_progress bug
+    went unnoticed for so long.
+  */
+  const updateRequestStatus = async (nextStatus) => {
   try {
     if (!requestId) {
       return;
     }
 
     setUpdating(true);
+    setActionError("");
 
-    const requestRef = doc(
-      db,
-      "consultation_requests",
-      requestId
-    );
+    /*
+      Accepting also creates the care link that grants this doctor
+      read access to the patient's profile and assessment history.
+      Without it the security rules have no way to tell this doctor
+      apart from any other, so the patient's records stay closed.
 
-    await updateDoc(requestRef, {
-      status: status,
-      respondedAt: serverTimestamp(),
-    });
+      Rejecting removes that link again.
+    */
+    if (nextStatus === STATUS.ACCEPTED) {
+      await acceptConsultation(requestId);
+    } else {
+      await rejectConsultation(requestId);
+    }
 
     setRequest((previous) => ({
       ...previous,
-      status: status,
+      status: nextStatus,
     }));
 
-    if (status === "accepted") {
-      alert("Consultation accepted successfully.");
-
-      // Go directly to video consultation
-      navigate(
-        `/video-consultation/${requestId}?role=doctor`
-      );
+    if (nextStatus === STATUS.ACCEPTED) {
+      /*
+        Do NOT jump straight into the call. The patient has to be
+        told the request was accepted and join from their own
+        screen; sending the doctor into an empty room first was
+        what made the old flow feel broken.
+      */
+      navigate("/doctor/dashboard");
 
       return;
     }
 
-    if (status === "rejected") {
-      alert("Consultation rejected.");
-
-      // Rejected → back to dashboard
-      navigate("/doctor/dashboard");
-    }
+    navigate("/doctor/dashboard");
 
   } catch (error) {
-    console.error(
-      "Error updating consultation:",
-      error
-    );
+    /*
+      The real Firebase error code, so a permission problem is
+      distinguishable from a network one. Deliberately logs the
+      code and the consultation id ONLY - never the patient's
+      health data, name or email.
+    */
+    console.error("Consultation update failed", {
+      requestId,
+      attemptedStatus: nextStatus,
+      code: error?.code || "none",
+      message: error?.message,
+    });
 
-    alert(
-      "Unable to update the consultation request."
-    );
+    /*
+      A safe, specific message. "Unable to update the consultation
+      request" told the doctor nothing and hid which of the three
+      writes had actually failed.
+    */
+    const friendly =
+      error?.code === "permission-denied"
+        ? /*
+             Name the step and the code. One generic sentence for three
+             different writes made this impossible to diagnose from a
+             screenshot - a care-link denial looked identical to a
+             status denial.
+           */
+          `The database refused this change at the "${
+            error?.step || "unknown"
+          }" step (permission-denied). This usually means the deployed ` +
+          "Firestore rules are older than the app. Deploy them with: " +
+          "firebase deploy --only firestore:rules,firestore:indexes"
+        : error?.code === "unavailable" ||
+          error?.code === "deadline-exceeded"
+        ? "Could not reach the server. Check your connection and try again."
+        : error?.code === "not-found"
+        ? "This consultation no longer exists."
+        : error?.message ||
+          "Could not update this consultation. Please try again.";
+
+    setActionError(friendly);
 
   } finally {
     setUpdating(false);
@@ -266,10 +293,20 @@ function DoctorRequest() {
     {};
 
 
-  console.log(
-    "Doctor page report:",
-    report
-  );
+  /*
+    The report contains patient health data, so it is never logged.
+    Which KEYS arrived is enough to diagnose a mapping problem.
+  */
+  if (import.meta.env.DEV) {
+    console.debug("Consultation report keys:", Object.keys(report));
+  }
+
+  /*
+    Requests created before the assessment snapshot was wired up
+    carry an empty report. Saying so plainly is better than a grid
+    of "Not provided", which looks like a loading failure.
+  */
+  const reportMissing = Object.keys(report).length === 0;
 
 
   // =====================================================
@@ -332,7 +369,12 @@ function DoctorRequest() {
     }
 
 
-    return "Not available";
+    /*
+      Genuinely absent, rather than a failed lookup. The brief asks
+      for "Not provided" so a doctor can tell "the patient did not
+      give us this" from "we could not load it".
+    */
+    return "Not provided";
   };
 
 
@@ -342,6 +384,7 @@ function DoctorRequest() {
 
   const age =
     getReportValue(
+      // model feature name first, then legacy spellings
       "age",
       "Age"
     );
@@ -349,6 +392,8 @@ function DoctorRequest() {
 
   const heartRate =
     getReportValue(
+      // thalach is the model feature; the rest are legacy records
+      "thalach",
       "heartRate",
       "heart_rate",
       "HeartRate",
@@ -360,6 +405,7 @@ function DoctorRequest() {
 
   const bloodPressure =
     getReportValue(
+      "trestbps",
       "bloodPressure",
       "blood_pressure",
       "BloodPressure",
@@ -370,6 +416,7 @@ function DoctorRequest() {
 
   const cholesterol =
     getReportValue(
+      "chol",
       "cholesterol",
       "Cholesterol"
     );
@@ -377,6 +424,7 @@ function DoctorRequest() {
 
   const ecg =
     getReportValue(
+      "restecg",
       "ecg",
       "ECG",
       "ecgResult",
@@ -386,6 +434,7 @@ function DoctorRequest() {
 
   const exerciseAngina =
     getReportValue(
+      "exang",
       "exerciseAngina",
       "exercise_angina",
       "ExerciseAngina",
@@ -393,9 +442,20 @@ function DoctorRequest() {
     );
 
 
-  const status =
-    request.status ||
-    "pending";
+  const status = normaliseStatus(request.status);
+
+  /*
+    The doctor's own join button had the same defect as the
+    patient's: gated on status === "accepted", it vanished as soon
+    as the doctor joined and the consultation became "in_progress".
+    A doctor who navigated back here mid-call could not get back in.
+
+    isJoinable covers both states for both roles, so the two
+    dashboards agree about the same stored status.
+  */
+  const canJoin = isJoinable(status);
+
+  const live = status === STATUS.IN_PROGRESS;
 
 
   // =====================================================
@@ -457,18 +517,18 @@ function DoctorRequest() {
           </span>
 
           <h2>
-            {status.toUpperCase()}
+            {statusLabel(status).toUpperCase()}
           </h2>
 
         </div>
 
         <p>
 
-          {status === "pending"
+          {status === STATUS.PENDING
             ? "This request is waiting for your review."
-            : status === "accepted"
-            ? "You have accepted this consultation request."
-            : "You have rejected this consultation request."}
+            : canJoin
+            ? statusHelp(status)
+            : statusHelp(status)}
 
         </p>
 
@@ -631,6 +691,19 @@ function DoctorRequest() {
 
         {/* ASSESSMENT VALUES */}
 
+        {reportMissing && (
+          <div className="doctor-report-missing" role="status">
+            <strong>No assessment values were saved with this request.</strong>
+
+            <p>
+              This consultation was created before the assessment
+              snapshot was captured, so there is nothing to display
+              here. Ask the patient to complete a new assessment, or
+              accept the request and review their history.
+            </p>
+          </div>
+        )}
+
         <div className="doctor-assessment-grid">
 
           <div>
@@ -656,7 +729,7 @@ function DoctorRequest() {
 
               {heartRate}
 
-              {heartRate !== "Not available"
+              {heartRate !== "Not provided"
                 ? " bpm"
                 : ""}
 
@@ -729,7 +802,7 @@ function DoctorRequest() {
     ACTIONS
 ================================================= */}
 
-{status === "pending" && (
+{status === STATUS.PENDING && (
   <div className="doctor-request-actions">
 
     <div className="doctor-action-text">
@@ -750,6 +823,17 @@ function DoctorRequest() {
 
     </div>
 
+    {/*
+      The real reason, not a generic "unable to update". The
+      console carries the Firebase error code alongside it for
+      diagnosis - without any patient health data.
+    */}
+    {actionError && (
+      <div className="doctor-action-error" role="alert">
+        {actionError}
+      </div>
+    )}
+
     <div className="doctor-action-buttons">
 
       {/* REJECT */}
@@ -759,7 +843,7 @@ function DoctorRequest() {
         className="doctor-reject-btn"
         disabled={updating}
         onClick={() =>
-          updateRequestStatus("rejected")
+          updateRequestStatus(STATUS.REJECTED)
         }
       >
         Reject Request
@@ -773,7 +857,7 @@ function DoctorRequest() {
         className="doctor-accept-btn"
         disabled={updating}
         onClick={() =>
-          updateRequestStatus("accepted")
+          updateRequestStatus(STATUS.ACCEPTED)
         }
       >
         {updating
@@ -791,23 +875,27 @@ function DoctorRequest() {
     ACCEPTED → VIDEO CONSULTATION
 ================================================= */}
 
-{status === "accepted" && (
+{canJoin && (
   <div className="video-ready-card">
 
     <div>
 
       <span className="video-ready-label">
-        CONSULTATION ACCEPTED
+        {live ? "CONSULTATION IN PROGRESS" : "CONSULTATION ACCEPTED"}
       </span>
 
       <h2>
-        Patient consultation is ready
+        {live
+          ? "This consultation is still open"
+          : "Patient consultation is ready"}
       </h2>
 
       <p>
-        You have accepted this patient's
-        consultation request. You can now
-        join the secure video consultation.
+        {live
+          ? `This consultation is already in progress. Rejoin if you
+             were disconnected.`
+          : `You have accepted this patient's consultation request.
+             You can now join the secure video consultation.`}
       </p>
 
     </div>
@@ -817,11 +905,11 @@ function DoctorRequest() {
       className="video-ready-button"
       onClick={() =>
         navigate(
-          `/video-consultation/${requestId}?role=doctor`
+          `/video-consultation/${requestId}`
         )
       }
     >
-      Join Video Consultation
+      {joinLabel(status)}
     </button>
 
   </div>

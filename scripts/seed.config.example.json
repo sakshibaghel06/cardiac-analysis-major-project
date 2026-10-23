@@ -1,0 +1,58 @@
+{
+  "_README": [
+    "Copy this file to scripts/seed.config.json and fill it in.",
+    "",
+    "HOW TO GET A DOCTOR UID:",
+    "  1. Firebase Console -> Authentication -> Users -> Add user",
+    "  2. Enter the doctor's email and a password",
+    "  3. Copy the 'User UID' column value (28 characters)",
+    "  4. Paste it as 'uid' below, with the same email",
+    "",
+    "This script never creates Auth accounts and never handles passwords.",
+    "",
+    "WHY THE UID MATTERS:",
+    "  Both the app (roleService.resolveRole) and firestore.rules ask the",
+    "  same question: does a document exist at doctors/{authUid}? So a",
+    "  doctor's Firestore document ID must BE their Auth UID. A 'uid'",
+    "  field on a differently-keyed document is not enough - the rules",
+    "  cannot run a query.",
+    "",
+    "  Two of your existing doctor records use auto-generated IDs, so the",
+    "  script re-keys them: it creates doctors/{uid} with their data and",
+    "  marks the old document unavailable rather than deleting anything."
+  ],
+
+  "doctors": [
+    {
+      "existingDocId": "7eBa7x88QCWxk2e7TyS5",
+      "uid": "",
+      "email": "",
+      "consultationFee": 600
+    },
+    {
+      "existingDocId": "j6ZGxq7LIYiXqaffvG6D",
+      "uid": "",
+      "email": "",
+      "consultationFee": 550
+    },
+    {
+      "existingDocId": "gSZwRdBFBQWSoAr5LAcDGaVPHyF2",
+      "uid": "gSZwRdBFBQWSoAr5LAcDGaVPHyF2",
+      "email": "",
+      "consultationFee": 500
+    }
+  ],
+
+  "hospitals": [
+    {
+      "docId": "KTSaUKKqTPU8xBZ0C2hi",
+      "latitude": null,
+      "longitude": null
+    },
+    {
+      "docId": "nqNHyTmuu7pfiA721cTc",
+      "latitude": null,
+      "longitude": null
+    }
+  ]
+}
