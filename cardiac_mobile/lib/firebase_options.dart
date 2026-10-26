@@ -31,30 +31,36 @@ class DefaultFirebaseOptions {
   static const String _senderId = String.fromEnvironment('FIREBASE_SENDER_ID');
   static const String _projectId = String.fromEnvironment('FIREBASE_PROJECT_ID');
 
-  /// Android needs its own app id; falls back to the web one.
-  static const String _androidAppId = String.fromEnvironment(
-    'FIREBASE_ANDROID_APP_ID',
-    defaultValue: _appId,
-  );
+  static const String _androidAppId =
+      String.fromEnvironment('FIREBASE_ANDROID_APP_ID');
 
-  static const String _iosAppId = String.fromEnvironment(
-    'FIREBASE_IOS_APP_ID',
-    defaultValue: _appId,
-  );
+  static const String _iosAppId =
+      String.fromEnvironment('FIREBASE_IOS_APP_ID');
 
   static const String _iosBundleId = String.fromEnvironment(
     'FIREBASE_IOS_BUNDLE_ID',
     defaultValue: 'com.cardiocare.cardiacMobile',
   );
 
-  static bool get isConfigured =>
-      _apiKey.isNotEmpty && _projectId.isNotEmpty && _senderId.isNotEmpty;
+  static bool get isConfigured {
+    final sharedValuesPresent =
+        _apiKey.isNotEmpty && _projectId.isNotEmpty && _senderId.isNotEmpty;
+
+    final platformAppIdPresent = switch (defaultTargetPlatform) {
+      TargetPlatform.android => _androidAppId.isNotEmpty,
+      TargetPlatform.iOS => _iosAppId.isNotEmpty,
+      _ => _appId.isNotEmpty,
+    };
+
+    return sharedValuesPresent && platformAppIdPresent;
+  }
 
   /// Explains what is missing, so a blank screen never has to be guessed at.
   static String get configurationHelp =>
       'Firebase is not configured.\n\n'
       'Copy firebase.example.json to firebase.local.json, fill in the values '
-      'from your Firebase console (the same project the React app uses), then '
+      'from the authorized Firebase project (use a separate app ID for each '
+      'platform), then '
       'run:\n\n'
       '  flutter run --dart-define-from-file=firebase.local.json';
 

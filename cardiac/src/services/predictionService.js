@@ -33,7 +33,7 @@ const isLocalHost =
 export const API_URL =
   import.meta.env.VITE_ML_API_URL ||
   import.meta.env.VITE_PREDICTION_API_URL ||
-  (isLocalHost ? "http://127.0.0.1:8000" : "");
+  (isLocalHost ? "http://127.0.0.1:8001" : "");
 
 export const apiConfigured = () => Boolean(API_URL);
 
@@ -96,7 +96,7 @@ export const predictRisk = async (features) => {
     */
     throw new Error(
       "Could not reach the risk assessment service. Make sure it is " +
-        "running:  cd cardiac_ml && uvicorn api:app --port 8000"
+        "running:  cd cardiac_ml && uvicorn api:app --host 127.0.0.1 --port 8001"
     );
   }
 

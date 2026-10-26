@@ -116,7 +116,7 @@ class _RiskAssessmentScreenState extends State<RiskAssessmentScreen> {
 
       final result = await PredictionService().predict(features);
 
-      await FirestoreService().saveAssessment(
+      final assessmentId = await FirestoreService().saveAssessment(
         features: features,
         result: result,
         emergencySymptoms: _reportedEmergencies,
@@ -130,6 +130,7 @@ class _RiskAssessmentScreenState extends State<RiskAssessmentScreen> {
             result: result,
             features: features,
             emergencySymptoms: _reportedEmergencies,
+            assessmentId: assessmentId,
           ),
         ),
       );

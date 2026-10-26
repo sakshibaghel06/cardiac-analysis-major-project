@@ -1,16 +1,17 @@
-import { useEffect, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useEffect, useState, useSyncExternalStore } from "react";
+import { useLocation, useNavigate, useParams } from "react-router-dom";
 
 import { useAuth } from "../context/useAuth";
 
-import {
-  PRESCRIPTION_STATE,
-  watchConsultation,
-} from "../services/consultationService";
+import { PRESCRIPTION_STATE, watchConsultation } from "../services/consultationService";
 
 import {
-  getPaymentConfig,
+  DEMO_PAYMENT_FEE,
+  downloadDemoReceipt,
+  getDemoPaymentSnapshot,
+  parseDemoPayment,
   payForConsultation,
+  subscribeDemoPayments,
 } from "../services/paymentService";
 
 /*
@@ -28,15 +29,12 @@ consultation so none of them needs a refresh:
             nothing to unlock. It never pretends the
             prescription is ready.
 
-  due       issued, unpaid. Fee summary and Razorpay.
+  due       issued, unpaid. Fee summary and demo payment.
 
-  paid      unlocked. Straight through to the
-            prescription.
+  paid      local demo receipt. The Firestore prescription
+            remains subject to its existing access rules.
 
-The amount shown comes from the consultation record, and
-the server re-checks it against the same record before
-creating an order - a price in the browser is a
-suggestion, not a fact.
+The demo amount is fixed at ₹500.
 
 Emergency help is reachable from here regardless of
 payment. Nothing about money may stand between a patient
@@ -47,15 +45,33 @@ and urgent care.
 function Payment() {
   const { requestId } = useParams();
   const navigate = useNavigate();
+  const location = useLocation();
   const { user, loading: authLoading } = useAuth();
 
-  const [consultation, setConsultation] = useState(null);
-  const [config, setConfig] = useState(null);
+  const routeConsultation =
+    location.state?.consultation?.id === requestId &&
+    location.state.consultation.patientId === user?.uid
+      ? location.state.consultation
+      : null;
+
+  const [consultation, setConsultation] = useState(routeConsultation);
 
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [cancelled, setCancelled] = useState(false);
+  const [loadNotice, setLoadNotice] = useState("");
+  const storedPayment = useSyncExternalStore(
+    subscribeDemoPayments,
+    () => getDemoPaymentSnapshot(requestId),
+    () => null
+  );
+  let demoPayment = null;
+  let paymentStorageError = "";
+  try {
+    demoPayment = parseDemoPayment(storedPayment, requestId);
+  } catch (storageError) {
+    paymentStorageError = storageError.message;
+  }
 
   // ---------------------------------------------------
   // LIVE CONSULTATION
@@ -86,41 +102,20 @@ function Payment() {
       (watchError) => {
         console.error(watchError);
 
-        setError(
-          watchError?.code === "permission-denied"
-            ? "You do not have access to this consultation."
-            : "Could not load this consultation. Please try again."
+        if (routeConsultation) {
+          setConsultation(routeConsultation);
+        } else {
+          setConsultation({ id: requestId });
+        }
+        setLoadNotice(
+          "Consultation details could not be loaded from Firebase. This local demo can still record payment for this reference; unavailable doctor details will not be invented."
         );
-
         setLoading(false);
       }
     );
 
     return unsubscribe;
-  }, [authLoading, user, requestId]);
-
-  // ---------------------------------------------------
-  // IS PAYMENT EVEN SET UP?
-  // ---------------------------------------------------
-
-  /*
-    The await comes before any setState, so the effect body does
-    not set state synchronously - which is what the cascading
-    render rule is guarding against.
-  */
-  useEffect(() => {
-    let cancelled = false;
-
-    (async () => {
-      const result = await getPaymentConfig();
-
-      if (!cancelled) setConfig(result);
-    })();
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+  }, [authLoading, user, requestId, location.state, routeConsultation]);
 
   // ---------------------------------------------------
   // PAY
@@ -128,27 +123,11 @@ function Payment() {
 
   const pay = async () => {
     setError("");
-    setCancelled(false);
 
     try {
       setBusy(true);
 
-      const result = await payForConsultation({
-        requestId,
-        doctorName: consultation.doctorName,
-      });
-
-      if (result.status === "cancelled") {
-        setCancelled(true);
-        return;
-      }
-
-      /*
-        No local "paid" flag is set here. The listener above
-        picks the change up only once the SERVER has verified
-        the signature and written paymentStatus. A success
-        callback in the browser proves nothing.
-      */
+      await payForConsultation({ requestId, consultation });
     } catch (payError) {
       console.error(payError);
       setError(payError.message);
@@ -194,10 +173,13 @@ function Payment() {
     );
   }
 
-  const fee = Number(consultation?.fee) || 0;
-  const paid = consultation?.paymentStatus === "paid";
+  const fee = DEMO_PAYMENT_FEE;
+  const paid =
+    consultation?.paymentStatus === "paid" || demoPayment?.status === "PAID";
+  const demoPaid = demoPayment?.status === "PAID";
   const prescriptionIssued =
-    consultation?.prescriptionStatus === PRESCRIPTION_STATE.ISSUED;
+    consultation?.prescriptionStatus === PRESCRIPTION_STATE.ISSUED ||
+    !consultation?.prescriptionStatus;
 
   return (
     <div className="pay-page">
@@ -207,12 +189,20 @@ function Payment() {
 
           <h1>
             {paid
-              ? "Payment received"
+              ? demoPaid
+                ? "Demo Payment Successful!"
+                : "Payment received"
               : prescriptionIssued
               ? "Your prescription is ready"
               : "Thank you for your consultation"}
           </h1>
         </header>
+
+        {loadNotice && (
+          <div className="pay-muted" role="status">
+            {loadNotice}
+          </div>
+        )}
 
         {/* ==========================================
             PAID
@@ -224,16 +214,64 @@ function Payment() {
               ✓
             </div>
 
-            <h2>Payment complete</h2>
+            <h2>
+              {demoPaid
+                ? "Payment Successful!"
+                : "Payment complete"}
+            </h2>
 
             <p>
-              Your consultation fee has been received and your prescription
-              is unlocked.
+              {demoPaid
+                ? "No real money was charged. The PAID status is local to this browser and is not synchronized with Firebase."
+                : "The consultation is marked paid in Firebase."}
             </p>
+
+            {demoPaid && (
+              <>
+                <dl className="pay-summary">
+                  <div>
+                    <dt>Consultation reference</dt>
+                    <dd className="pay-ref">{requestId}</dd>
+                  </div>
+                  <div>
+                    <dt>Fee</dt>
+                    <dd>₹{DEMO_PAYMENT_FEE}</dd>
+                  </div>
+                  <div>
+                    <dt>Paid at</dt>
+                    <dd>{new Date(demoPayment.paidAt).toLocaleString()}</dd>
+                  </div>
+                  <div>
+                    <dt>Demo transaction reference</dt>
+                    <dd>{demoPayment.transactionReference}</dd>
+                  </div>
+                </dl>
+                <div className="pay-demo-notice" role="note">
+                  DEMO PAYMENT — No real money will be charged. This status
+                  is stored only in this browser and is not synchronized with
+                  Firebase.
+                </div>
+                <p className="pay-fineprint">
+                  Prescription contents remain protected by Firebase
+                  permissions. If the prescription record is unavailable,
+                  the prescription page will say so rather than invent details.
+                </p>
+                <button
+                  className="pay-secondary"
+                  onClick={() => downloadDemoReceipt(demoPayment)}
+                >
+                  Download Receipt
+                </button>
+              </>
+            )}
 
             <button
               className="pay-primary"
-              onClick={() => navigate(`/prescription/${requestId}`)}
+              onClick={() =>
+                navigate(`/prescription/${requestId}`, {
+                  state: { consultation },
+                })
+              }
             >
               View &amp; Download Prescription
             </button>
@@ -299,15 +337,13 @@ function Payment() {
               <dl className="pay-summary">
                 <div>
                   <dt>Doctor</dt>
-                  <dd>{consultation?.doctorName || "-"}</dd>
+                  <dd>{consultation?.doctorName || "Not available"}</dd>
                 </div>
 
-                {consultation?.hospitalName && (
-                  <div>
-                    <dt>Hospital</dt>
-                    <dd>{consultation.hospitalName}</dd>
-                  </div>
-                )}
+                <div>
+                  <dt>Hospital</dt>
+                  <dd>{consultation?.hospitalName || "Not available"}</dd>
+                </div>
 
                 <div>
                   <dt>Consultation reference</dt>
@@ -319,17 +355,12 @@ function Payment() {
                   <dd>
                     {consultation?.completedAt?.toDate
                       ? consultation.completedAt.toDate().toLocaleDateString()
-                      : "-"}
+                      : consultation?.createdAt?.toDate
+                      ? consultation.createdAt.toDate().toLocaleDateString()
+                      : "Not available"}
                   </dd>
                 </div>
               </dl>
-
-              {/*
-                Consultation fee only. No platform fee or tax line
-                is shown, because none is configured - inventing a
-                charge the project has not actually set up would be
-                fabricating a number on an invoice.
-              */}
               <div className="pay-total">
                 <div className="pay-total-row">
                   <span>Consultation fee</span>
@@ -344,70 +375,50 @@ function Payment() {
             </div>
 
             <div className="pay-card">
-              <h2>Pay to unlock your prescription</h2>
+              <h2>Pay to Unlock Your Prescription</h2>
 
-              {config && !config.configured ? (
-                <div className="pay-notice" role="status">
-                  <strong>Online payment is not set up on this server.</strong>
+              <p className="pay-muted">
+                Record a demo payment in this browser. This does not update
+                Firebase or change prescription permissions.
+              </p>
 
-                  <p>
-                    {config.unreachable
-                      ? "The payment service could not be reached. Start the API, or try again shortly."
-                      : "Razorpay test keys have not been configured. Your prescription cannot be unlocked until payment is available."}
-                  </p>
-                </div>
-              ) : (
-                <>
-                  <p className="pay-muted">
-                    You will be taken to Razorpay to pay by card, UPI, net
-                    banking or wallet. CardioCare never sees or stores your
-                    card details.
-                  </p>
+              <div className="pay-demo-notice" role="status">
+                <strong>DEMO PAYMENT</strong> — No real money will be charged.
+              </div>
 
-                  {config?.mode === "test" && (
-                    <div className="pay-testmode">
-                      <strong>Test mode</strong> - no real money will be
-                      taken.
-                    </div>
-                  )}
-                </>
-              )}
-
-              {cancelled && (
-                <div className="pay-notice" role="status">
-                  <strong>Payment cancelled.</strong>
-
-                  <p>
-                    Nothing has been charged, and your prescription is safe.
-                    You can try again whenever you are ready.
-                  </p>
-                </div>
-              )}
-
-              {error && (
+              {(error || paymentStorageError) && (
                 <div className="pay-error" role="alert">
-                  {error}
+                  {error || paymentStorageError}
                 </div>
               )}
 
               <button
                 className="pay-primary"
                 onClick={pay}
-                disabled={busy || (config && !config.configured)}
+                disabled={busy}
+                aria-busy={busy}
               >
-                {busy ? "Opening payment..." : `Pay ₹${fee} & Unlock Prescription`}
+                {busy ? (
+                  <>
+                    <span className="pay-spinner" aria-hidden="true" />
+                    Processing demo payment...
+                  </>
+                ) : (
+                  `Pay ₹${fee} & Unlock Prescription`
+                )}
               </button>
 
               <button
                 className="pay-secondary"
                 onClick={() => navigate("/patient/dashboard")}
+                disabled={busy}
               >
                 Pay Later
               </button>
 
               <p className="pay-fineprint">
-                Your prescription has been issued and is stored safely. Paying
-                later does not lose it.
+                Pay Later does not mark this browser as paid. Prescription
+                access remains subject to Firebase's existing rules.
               </p>
             </div>
           </>

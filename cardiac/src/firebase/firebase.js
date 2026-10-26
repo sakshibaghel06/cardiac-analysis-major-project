@@ -1,6 +1,7 @@
 import { initializeApp } from "firebase/app";
 import { getAuth } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
+import { missingFirebaseConfigKeys } from "../services/firebaseConfig";
 
 /*
 =====================================================
@@ -32,29 +33,24 @@ const firebaseConfig = {
   appId: import.meta.env.VITE_FIREBASE_APP_ID,
 };
 
-/*
-Fail loudly at startup instead of producing confusing
-"permission denied" / "invalid API key" errors later on
-when somebody has forgotten to create their .env file.
-*/
+export const missingFirebaseKeys = missingFirebaseConfigKeys(firebaseConfig);
+export const firebaseConfigured = missingFirebaseKeys.length === 0;
 
-const missingKeys = Object.entries(firebaseConfig)
-  .filter(([, value]) => !value)
-  .map(([key]) => key);
+let app = null;
+let auth = null;
+let db = null;
+let firebaseInitializationError = null;
 
-if (missingKeys.length > 0) {
-  throw new Error(
-    "Firebase configuration is incomplete. Missing: " +
-      missingKeys.join(", ") +
-      ". Copy cardiac/.env.example to cardiac/.env and fill it in, " +
-      "then restart the dev server (Vite only reads .env at startup)."
-  );
+if (firebaseConfigured) {
+  try {
+    app = initializeApp(firebaseConfig);
+    auth = getAuth(app);
+    db = getFirestore(app);
+  } catch (error) {
+    firebaseInitializationError = error;
+  }
 }
 
-const app = initializeApp(firebaseConfig);
-
-export const auth = getAuth(app);
-
-export const db = getFirestore(app);
+export { auth, db, firebaseInitializationError };
 
 export default app;

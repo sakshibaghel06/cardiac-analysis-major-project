@@ -21,12 +21,17 @@ import {
 
 import { readFileSync } from "node:fs";
 import {
+  collection,
   doc,
+  getDocs,
   getDoc,
   setDoc,
   updateDoc,
   deleteDoc,
+  query,
   serverTimestamp,
+  where,
+  writeBatch,
 } from "firebase/firestore";
 
 const PATIENT_A = "patient_alice";
@@ -36,6 +41,7 @@ const DOCTOR_2 = "doctor_two";
 
 const REQUEST_A1 = "request_alice_doctor1";
 const REQUEST_A2 = "request_alice_doctor1_paid";
+const REQUEST_A3 = "request_alice_legacy_unlinked";
 
 let passed = 0;
 let failed = 0;
@@ -59,7 +65,7 @@ const testEnv = await initializeTestEnvironment({
   firestore: {
     rules: readFileSync("firestore.rules", "utf8"),
     host: "127.0.0.1",
-    port: 8080,
+    port: Number(process.env.FIRESTORE_EMULATOR_PORT || 8080),
   },
 });
 
@@ -97,7 +103,8 @@ await testEnv.withSecurityRulesDisabled(async (context) => {
 
   await setDoc(doc(db, "consultation_requests", REQUEST_A1), {
     patientId: PATIENT_A, doctorId: DOCTOR_1, status: "accepted",
-    risk: "HIGH", report: {},
+    risk: "HIGH", report: {}, fee: 500, paymentStatus: "unpaid",
+    prescriptionStatus: "issued", prescriptionId: "rx_unpaid",
   });
 
   // Doctor 1 has accepted Alice. Doctor 2 has no link to anyone.
@@ -122,15 +129,28 @@ await testEnv.withSecurityRulesDisabled(async (context) => {
     prescriptionStatus: "issued",
   });
 
+  // Legacy issued prescription: the consultation status is uppercase
+  // and the prescription document id was never copied onto the request.
+  await setDoc(doc(db, "consultation_requests", REQUEST_A3), {
+    patientId: PATIENT_A, doctorId: DOCTOR_1, status: "COMPLETED",
+    risk: "MODERATE", report: {}, fee: 500, paymentStatus: "unpaid",
+    prescriptionStatus: "issued",
+  });
+
   await setDoc(doc(db, "prescriptions", "rx_unpaid"), {
     patientId: PATIENT_A, doctorId: DOCTOR_1, requestId: REQUEST_A1,
     status: "issued", unlocked: false, medicines: [],
   });
 
-  // Unlocked by the server after it verified the payment.
+  // Unlocked after the consultation payment has been recorded.
   await setDoc(doc(db, "prescriptions", "rx_paid"), {
     patientId: PATIENT_A, doctorId: DOCTOR_1, requestId: REQUEST_A2,
     status: "issued", unlocked: true, medicines: [],
+  });
+
+  await setDoc(doc(db, "prescriptions", "rx_legacy_unlinked"), {
+    patientId: PATIENT_A, doctorId: DOCTOR_1, requestId: REQUEST_A3,
+    status: "issued", unlocked: false, medicines: [],
   });
 
   await setDoc(doc(db, "prescriptions", "rx_draft"), {
@@ -147,8 +167,8 @@ await testEnv.withSecurityRulesDisabled(async (context) => {
   });
 
   await setDoc(doc(db, "hospitals", "h1", "private", "settlement"), {
-    razorpayLinkedAccountId: "acc_SECRET123",
-    payoutOnboardingStatus: "verified",
+    payoutAccountId: "payout_SECRET123",
+    payoutStatus: "verified",
   });
 
   await setDoc(doc(db, "payments", "pay_alice"), {
@@ -321,7 +341,7 @@ await check(
   )
 );
 await check(
-  "the patient CANNOT unlock their own prescription",
+  "the patient CANNOT unlock a prescription without the demo payment batch",
   assertFails(
     updateDoc(doc(alice, "prescriptions", "rx_unpaid"), { unlocked: true })
   )
@@ -335,10 +355,162 @@ await check(
   )
 );
 
-console.log("\n=== Money is server-only ===");
+console.log("\n=== Demo payment is limited to the consultation owner ===");
 
 await check(
-  "the patient CANNOT mark their consultation paid",
+  "the patient can read their legacy issued consultation",
+  assertSucceeds(getDoc(doc(alice, "consultation_requests", REQUEST_A3)))
+);
+await check(
+  "the linked doctor can read their legacy issued prescription",
+  assertSucceeds(getDoc(doc(doctor1, "prescriptions", "rx_legacy_unlinked")))
+);
+await check(
+  "another doctor CANNOT read the legacy prescription",
+  assertFails(getDoc(doc(doctor2, "prescriptions", "rx_legacy_unlinked")))
+);
+await check(
+  "the patient cannot read the legacy prescription before payment",
+  assertFails(getDoc(doc(alice, "prescriptions", "rx_legacy_unlinked")))
+);
+await check(
+  "the authorized doctor can query their issued legacy prescription",
+  assertSucceeds(
+    getDocs(
+      query(
+        collection(doctor1, "prescriptions"),
+        where("requestId", "==", REQUEST_A3),
+        where("doctorId", "==", DOCTOR_1)
+      )
+    )
+  )
+);
+await check(
+  "another doctor CANNOT query the issuing doctor's prescription",
+  assertFails(
+    getDocs(
+      query(
+        collection(doctor2, "prescriptions"),
+        where("requestId", "==", REQUEST_A3),
+        where("doctorId", "==", DOCTOR_1)
+      )
+    )
+  )
+);
+await check(
+  "another doctor querying only their own prescriptions sees no legacy record",
+  (async () => {
+    const snapshot = await getDocs(
+      query(
+        collection(doctor2, "prescriptions"),
+        where("requestId", "==", REQUEST_A3),
+        where("doctorId", "==", DOCTOR_2)
+      )
+    );
+    if (!snapshot.empty) {
+      throw new Error("A prescription belonging to another doctor was returned.");
+    }
+  })()
+);
+await check(
+  "the patient CANNOT arbitrarily link an issued prescription",
+  assertFails(
+    updateDoc(doc(alice, "consultation_requests", REQUEST_A3), {
+      prescriptionId: "rx_legacy_unlinked",
+      updatedAt: serverTimestamp(),
+    })
+  )
+);
+await check(
+  "another doctor CANNOT link a prescription to the consultation",
+  assertFails(
+    updateDoc(doc(doctor2, "consultation_requests", REQUEST_A3), {
+      prescriptionId: "rx_legacy_unlinked",
+      updatedAt: serverTimestamp(),
+    })
+  )
+);
+await check(
+  "the authorized doctor CANNOT link a prescription from another consultation",
+  assertFails(
+    updateDoc(doc(doctor1, "consultation_requests", REQUEST_A3), {
+      prescriptionId: "rx_paid",
+      updatedAt: serverTimestamp(),
+    })
+  )
+);
+await check(
+  "the authorized doctor can backfill the missing prescription link",
+  assertSucceeds(
+    updateDoc(doc(doctor1, "consultation_requests", REQUEST_A3), {
+      prescriptionId: "rx_legacy_unlinked",
+      updatedAt: serverTimestamp(),
+    })
+  )
+);
+await check(
+  "the patient payment page query excludes its locked prescription without permission errors",
+  (async () => {
+    const snapshot = await getDocs(
+      query(
+        collection(alice, "prescriptions"),
+        where("requestId", "==", REQUEST_A3),
+        where("patientId", "==", PATIENT_A),
+        where("unlocked", "==", true)
+      )
+    );
+    if (!snapshot.empty) {
+      throw new Error("A locked prescription was returned to the patient.");
+    }
+  })()
+);
+await check(
+  "another patient CANNOT demo-pay or unlock the linked consultation",
+  assertFails((async () => {
+    const batch = writeBatch(bob);
+    batch.update(doc(bob, "consultation_requests", REQUEST_A3), {
+      paymentStatus: "paid",
+      paymentMethod: "DEMO",
+      paidAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    batch.update(doc(bob, "prescriptions", "rx_legacy_unlinked"), {
+      unlocked: true,
+      paymentMethod: "DEMO",
+      unlockedAt: serverTimestamp(),
+    });
+    await batch.commit();
+  })())
+);
+await check(
+  "the patient can atomically pay and unlock the backfilled prescription",
+  assertSucceeds((async () => {
+    const batch = writeBatch(alice);
+    batch.update(doc(alice, "consultation_requests", REQUEST_A3), {
+      paymentStatus: "paid",
+      paymentMethod: "DEMO",
+      paidAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    batch.update(doc(alice, "prescriptions", "rx_legacy_unlinked"), {
+      unlocked: true,
+      paymentMethod: "DEMO",
+      unlockedAt: serverTimestamp(),
+    });
+    await batch.commit();
+  })())
+);
+await check(
+  "the patient can read their prescription after the demo payment",
+  assertSucceeds(getDoc(doc(alice, "prescriptions", "rx_legacy_unlinked")))
+);
+await check(
+  "another patient CANNOT read the unlocked prescription",
+  assertFails(getDoc(doc(bob, "prescriptions", "rx_legacy_unlinked")))
+);
+
+await check(
+  "the patient CANNOT mark their consultation paid without unlocking its prescription",
   assertFails(
     updateDoc(doc(alice, "consultation_requests", REQUEST_A1), {
       paymentStatus: "paid",
@@ -350,6 +522,73 @@ await check(
   assertFails(
     updateDoc(doc(doctor1, "consultation_requests", REQUEST_A1), {
       status: "completed", paymentStatus: "paid",
+    })
+  )
+);
+await check(
+  "another patient CANNOT set the demo payment on Alice's consultation",
+  assertFails(
+    updateDoc(doc(bob, "consultation_requests", REQUEST_A1), {
+      paymentStatus: "paid",
+      paymentMethod: "DEMO",
+      paidAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    })
+  )
+);
+await check(
+  "a demo payment cannot modify clinical prescription details",
+  assertFails(
+    updateDoc(doc(alice, "prescriptions", "rx_unpaid"), {
+      diagnosis: "tampered",
+      unlocked: true,
+      paymentMethod: "DEMO",
+      unlockedAt: serverTimestamp(),
+    })
+  )
+);
+await check(
+  "a patient can atomically demo-pay and unlock their issued prescription",
+  assertSucceeds((async () => {
+    const batch = writeBatch(alice);
+    batch.update(doc(alice, "consultation_requests", REQUEST_A1), {
+      paymentStatus: "paid",
+      paymentMethod: "DEMO",
+      paidAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    batch.update(doc(alice, "prescriptions", "rx_unpaid"), {
+      unlocked: true,
+      paymentMethod: "DEMO",
+      unlockedAt: serverTimestamp(),
+    });
+    await batch.commit();
+  })())
+);
+await check(
+  "demo payment remains persisted on refresh and unlocks the linked prescription",
+  (async () => {
+    const [consultation, prescription] = await Promise.all([
+      getDoc(doc(alice, "consultation_requests", REQUEST_A1)),
+      getDoc(doc(alice, "prescriptions", "rx_unpaid")),
+    ]);
+    if (
+      consultation.data()?.paymentStatus !== "paid" ||
+      consultation.data()?.paymentMethod !== "DEMO" ||
+      prescription.data()?.unlocked !== true ||
+      prescription.data()?.paymentMethod !== "DEMO"
+    ) {
+      throw new Error("Demo payment state was not persisted consistently.");
+    }
+  })()
+);
+await check(
+  "a patient CANNOT unlock a prescription from a different patient's consultation",
+  assertFails(
+    updateDoc(doc(bob, "prescriptions", "rx_unpaid"), {
+      unlocked: true,
+      paymentMethod: "DEMO",
+      unlockedAt: serverTimestamp(),
     })
   )
 );
@@ -446,6 +685,22 @@ await check(
   assertSucceeds(
     updateDoc(doc(doctor1, "consultation_requests", REQUEST_A1), {
       status: "in_progress",
+    })
+  )
+);
+await check(
+  "the issuing doctor can safely link an existing issued prescription",
+  assertSucceeds(
+    updateDoc(doc(doctor1, "consultation_requests", REQUEST_A2), {
+      prescriptionId: "rx_paid",
+    })
+  )
+);
+await check(
+  "the issuing doctor CANNOT link a prescription from another consultation",
+  assertFails(
+    updateDoc(doc(doctor1, "consultation_requests", REQUEST_A1), {
+      prescriptionId: "rx_paid",
     })
   )
 );
@@ -641,7 +896,7 @@ await check(
   "nobody can write a payout destination from a client",
   assertFails(
     setDoc(doc(doctor1, "hospitals", "h1", "private", "settlement"), {
-      razorpayLinkedAccountId: "acc_ATTACKER",
+      payoutAccountId: "payout_ATTACKER",
     })
   )
 );

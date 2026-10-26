@@ -27,8 +27,9 @@ rules_version = '2';
 // Two mitigations are applied below: the shape and range of the result
 // are validated, and assessments are IMMUTABLE once created. Closing
 // this properly needs a trusted writer - a Cloud Function or the API
-// itself using the Admin SDK. The same applies to payments, which is
-// why clients can never set a payment to 'paid'.
+// itself using the Admin SDK. Demo payments are explicitly simulated;
+// their writes are limited to the patient's own issued consultation
+// and its linked prescription.
 // =====================================================================
 
 service cloud.firestore {
@@ -197,11 +198,9 @@ service cloud.firestore {
       /*
         SETTLEMENT DETAILS  -  not readable by anyone, ever.
 
-        The Razorpay linked-account id and onboarding state live
-        here rather than on the hospital document, because that
-        document is readable by every signed-in patient. A linked
-        account id is a payout destination; it has no business
-        being in a directory listing.
+        Private settlement details live here rather than on the
+        hospital document, because that document is readable by
+        every signed-in patient.
 
         Only the Admin SDK reaches this, and the Admin SDK bypasses
         rules - so "deny everyone" is the correct rule, not an
@@ -264,21 +263,9 @@ service cloud.firestore {
         && request.resource.data.status == 'pending'
         && request.resource.data.createdAt == request.time;
 
-      // The named doctor accepts, rejects or completes.
-      /*
-        The named doctor accepts, starts, declines or completes,
-        and records that a prescription has been issued.
-
-        Two things they can NEVER touch:
-
-          risk / report   the patient's own assessment result
-          paymentStatus   money. Only the server may mark a
-                          consultation paid, after it has
-                          verified the Razorpay signature. The
-                          Admin SDK bypasses these rules, which
-                          is exactly why no client path to this
-                          field may exist - including a doctor's.
-      */
+      // The named doctor accepts, starts, declines or completes,
+      // and records the prescription id when issuing it. Payment
+      // fields remain unavailable to the doctor.
       allow update: if signedIn()
         && resource.data.doctorId == request.auth.uid
         && request.resource.data.patientId == resource.data.patientId
@@ -290,7 +277,16 @@ service cloud.firestore {
         && !('report' in changed())
         && !('fee' in changed())
         && !('paymentStatus' in changed())
-        && !('paymentId' in changed());
+        && !('paymentMethod' in changed())
+        && !('paidAt' in changed())
+        && !('paymentId' in changed())
+        && (!('prescriptionId' in changed())
+            || (request.resource.data.prescriptionId is string
+                && exists(/databases/$(database)/documents/prescriptions/$(request.resource.data.prescriptionId))
+                && get(/databases/$(database)/documents/prescriptions/$(request.resource.data.prescriptionId)).data.requestId == requestId
+                && get(/databases/$(database)/documents/prescriptions/$(request.resource.data.prescriptionId)).data.patientId == resource.data.patientId
+                && get(/databases/$(database)/documents/prescriptions/$(request.resource.data.prescriptionId)).data.doctorId == resource.data.doctorId
+                && get(/databases/$(database)/documents/prescriptions/$(request.resource.data.prescriptionId)).data.status == 'issued'));
 
       // The patient may only cancel, and only while still pending.
       /*
@@ -303,6 +299,39 @@ service cloud.firestore {
         && resource.data.status == 'pending'
         && request.resource.data.status == 'cancelled'
         && changed().hasOnly(['status', 'updatedAt']);
+
+      // A doctor may backfill a missing pointer for an already-issued
+      // prescription without changing the legacy consultation status.
+      allow update: if isDoctor()
+        && resource.data.doctorId == request.auth.uid
+        && resource.data.prescriptionStatus == 'issued'
+        && !('prescriptionId' in resource.data)
+        && request.resource.data.patientId == resource.data.patientId
+        && request.resource.data.doctorId == resource.data.doctorId
+        && request.resource.data.prescriptionId is string
+        && request.resource.data.updatedAt == request.time
+        && changed().hasOnly(['prescriptionId', 'updatedAt'])
+        && exists(/databases/$(database)/documents/prescriptions/$(request.resource.data.prescriptionId))
+        && get(/databases/$(database)/documents/prescriptions/$(request.resource.data.prescriptionId)).data.requestId == requestId
+        && get(/databases/$(database)/documents/prescriptions/$(request.resource.data.prescriptionId)).data.patientId == resource.data.patientId
+        && get(/databases/$(database)/documents/prescriptions/$(request.resource.data.prescriptionId)).data.doctorId == request.auth.uid
+        && get(/databases/$(database)/documents/prescriptions/$(request.resource.data.prescriptionId)).data.status == 'issued';
+
+      // Demo payment and prescription unlock must commit together.
+      allow update: if signedIn()
+        && resource.data.patientId == request.auth.uid
+        && resource.data.prescriptionStatus == 'issued'
+        && resource.data.get('paymentStatus', 'unpaid') != 'paid'
+        && resource.data.prescriptionId is string
+        && request.resource.data.patientId == resource.data.patientId
+        && request.resource.data.doctorId == resource.data.doctorId
+        && request.resource.data.paymentStatus == 'paid'
+        && request.resource.data.paymentMethod == 'DEMO'
+        && request.resource.data.paidAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && changed().hasOnly(['paymentStatus', 'paymentMethod', 'paidAt', 'updatedAt'])
+        && getAfter(/databases/$(database)/documents/prescriptions/$(resource.data.prescriptionId)).data.unlocked == true
+        && getAfter(/databases/$(database)/documents/prescriptions/$(resource.data.prescriptionId)).data.paymentMethod == 'DEMO';
 
       allow delete: if false;
     }
@@ -419,32 +448,16 @@ service cloud.firestore {
         carries prescriptionStatus. So they can see that one is
         pending or ready without seeing what it says.
 
-        paymentStatus is only ever written by the server after
-        it verifies the Razorpay signature, so a client cannot
-        unlock this by editing anything it controls.
+        Patients can read only after the linked prescription has
+        been unlocked by the demo-payment batch below.
       */
       allow read: if isDoctor()
         && resource.data.doctorId == request.auth.uid;
 
       /*
-        The patient's gate is a single boolean ON THIS DOCUMENT,
-        deliberately - not a lookup into the consultation.
-
-        Rules are evaluated per document for a LIST query, and a
-        single row that fails kills the ENTIRE query. The previous
-        version checked status AND the consultation's paymentStatus,
-        so one unpaid prescription made
-        `where patientId == me` fail outright - which is why the
-        patient dashboard showed a permission error and every count
-        read zero.
-
-        `unlocked` can be named in the query, so the query becomes
-        provably safe and simply does not return locked rows.
-
-        It is written ONLY by the server, in the same operation that
-        verifies the Razorpay signature. No client can set it: there
-        is no client write path to prescriptions except the issuing
-        doctor's, and that path is forbidden from touching it below.
+        `unlocked` can be named in the query, so locked rows are not
+        returned. Demo payment writes this marker only in a batch that
+        also marks the owner's issued consultation paid.
       */
       allow read: if signedIn()
         && resource.data.patientId == request.auth.uid
@@ -487,6 +500,24 @@ service cloud.firestore {
         // Unlocking is a payment outcome, not a clinical one.
         && !('unlocked' in changed());
 
+      allow update: if signedIn()
+        && resource.data.patientId == request.auth.uid
+        && resource.data.status == 'issued'
+        && resource.data.get('unlocked', false) == false
+        && request.resource.data.patientId == resource.data.patientId
+        && request.resource.data.doctorId == resource.data.doctorId
+        && request.resource.data.requestId == resource.data.requestId
+        && request.resource.data.status == resource.data.status
+        && request.resource.data.unlocked == true
+        && request.resource.data.paymentMethod == 'DEMO'
+        && request.resource.data.unlockedAt == request.time
+        && changed().hasOnly(['unlocked', 'paymentMethod', 'unlockedAt'])
+        && getAfter(/databases/$(database)/documents/consultation_requests/$(resource.data.requestId)).data.patientId == request.auth.uid
+        && getAfter(/databases/$(database)/documents/consultation_requests/$(resource.data.requestId)).data.prescriptionStatus == 'issued'
+        && getAfter(/databases/$(database)/documents/consultation_requests/$(resource.data.requestId)).data.prescriptionId == prescriptionId
+        && getAfter(/databases/$(database)/documents/consultation_requests/$(resource.data.requestId)).data.paymentStatus == 'paid'
+        && getAfter(/databases/$(database)/documents/consultation_requests/$(resource.data.requestId)).data.paymentMethod == 'DEMO';
+
       allow delete: if false;
     }
 
@@ -495,25 +526,15 @@ service cloud.firestore {
     // PAYMENTS
     // =================================================================
     //
-    // A client may OPEN a payment but may never mark one successful.
-    // Only a trusted server that has verified the gateway signature can
-    // move a payment to 'paid', and that server uses the Admin SDK,
-    // which bypasses these rules entirely.
-
+    // Legacy payment documents are read-only. Demo payments are stored
+    // on the consultation and prescription and need no payment record.
     match /payments/{paymentId} {
 
       allow read: if signedIn()
         && (resource.data.patientId == request.auth.uid
             || resource.data.doctorId == request.auth.uid);
 
-      allow create: if signedIn()
-        && request.resource.data.patientId == request.auth.uid
-        && request.resource.data.status == 'created'
-        && request.resource.data.createdAt == request.time;
-
-      // Deliberately closed. The frontend NEVER decides that a payment
-      // succeeded - that is the whole point.
-      allow update, delete: if false;
+      allow create, update, delete: if false;
     }
 
 

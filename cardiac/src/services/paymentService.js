@@ -1,235 +1,167 @@
-import {
-  collection,
-  getDocs,
-  query,
-  where,
-} from "firebase/firestore";
+const PAYMENT_STORAGE_PREFIX = "cardiocare.demo-payment.";
+const DEMO_FEE = 500;
+const STORAGE_ERROR = "__CARDIOCARE_DEMO_PAYMENT_STORAGE_ERROR__";
 
-import { auth, db } from "../firebase/firebase";
+const delay = (milliseconds) =>
+  new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 
-// Same service, same base URL - imported so the two cannot drift.
-import { API_URL, apiConfigured } from "./predictionService";
+const paymentKey = (requestId) =>
+  `${PAYMENT_STORAGE_PREFIX}${encodeURIComponent(requestId)}`;
 
-/*
-=====================================================
-PAYMENT SERVICE (browser side)
-=====================================================
+export const getDemoPayment = (requestId) => {
+  if (!requestId) return null;
 
-This file deliberately CANNOT mark a payment successful.
-
-  * It never writes to /payments - Firestore rules refuse
-    every client write to that collection.
-  * It only forwards Razorpay's signed response to the
-    API, which recomputes the HMAC with the key secret
-    and decides.
-  * It never sees, handles or stores card details. Those
-    go straight from the patient to Razorpay's widget.
-
-So a patient who edits this JavaScript, fakes a success
-callback or replays a response still cannot get a
-consultation marked paid.
-
-See cardiac_ml/payments.py for the server half.
-=====================================================
-*/
-
-const RAZORPAY_SCRIPT = "https://checkout.razorpay.com/v1/checkout.js";
-
-export const PAYMENT_STATUS = {
-  UNPAID: "unpaid",
-  CREATED: "created",
-  PAID: "paid",
-  FAILED: "failed",
-  REFUNDED: "refunded",
+  return parseDemoPayment(getDemoPaymentSnapshot(requestId), requestId);
 };
 
-// -----------------------------------------------------
-// IS PAYMENT EVEN SET UP?
-// -----------------------------------------------------
-
-export const getPaymentConfig = async () => {
-  if (!apiConfigured()) return { configured: false, unreachable: true };
+export const getDemoPaymentSnapshot = (requestId) => {
+  if (!requestId) return null;
 
   try {
-    const response = await fetch(`${API_URL}/payments/config`);
-
-    if (!response.ok) return { configured: false };
-
-    return response.json();
+    return window.localStorage.getItem(paymentKey(requestId));
   } catch {
-    return { configured: false, unreachable: true };
+    return STORAGE_ERROR;
   }
 };
 
-// -----------------------------------------------------
-// LOAD THE CHECKOUT WIDGET
-// -----------------------------------------------------
-
-const loadRazorpayScript = () =>
-  new Promise((resolve) => {
-    if (window.Razorpay) {
-      resolve(true);
-      return;
-    }
-
-    const script = document.createElement("script");
-    script.src = RAZORPAY_SCRIPT;
-    script.onload = () => resolve(true);
-    script.onerror = () => resolve(false);
-
-    document.body.appendChild(script);
-  });
-
-// -----------------------------------------------------
-// PAY
-// -----------------------------------------------------
-
-/*
-Resolves  { status: 'paid' }        - verified by the server
-          { status: 'cancelled' }   - patient closed the widget
-Rejects   on a real error.
-*/
-export const payForConsultation = async ({
-  requestId,
-  doctorName,
-}) => {
-  const user = auth.currentUser;
-
-  if (!user) throw new Error("Please sign in to pay for this consultation.");
-
-  const config = await getPaymentConfig();
-
-  if (!config.configured) {
-    throw new Error(
-      config.unreachable
-        ? "Could not reach the payment service. Make sure the API is running."
-        : "Online payment is not configured yet. Set RAZORPAY_KEY_ID and " +
-          "RAZORPAY_KEY_SECRET on the API and restart it."
-    );
+export const parseDemoPayment = (stored, requestId) => {
+  if (stored === STORAGE_ERROR) {
+    throw new Error("Browser storage is unavailable for the demo payment.");
   }
+  if (!stored) return null;
 
-  // ---- 1. server creates the order --------------------
-  const orderResponse = await fetch(`${API_URL}/payments/create-order`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    /*
-      No amount is sent. The server reads the fee from the
-      consultation record itself, so there is nothing here for a
-      patient to tamper with.
-    */
-    body: JSON.stringify({
-      requestId,
-      patientId: user.uid,
-    }),
-  });
+  try {
+    const payment = JSON.parse(stored);
 
-  if (!orderResponse.ok) {
-    const problem = await orderResponse.json().catch(() => null);
-
-    throw new Error(
-      problem?.detail || "Could not start the payment. Please try again."
-    );
+    return payment?.status === "PAID" &&
+      payment?.requestId === requestId &&
+      typeof payment?.transactionReference === "string" &&
+      typeof payment?.paidAt === "string"
+      ? payment
+      : null;
+  } catch {
+    throw new Error("The saved demo payment record could not be read.");
   }
-
-  const order = await orderResponse.json();
-
-  // ---- 2. open the checkout widget --------------------
-  const scriptLoaded = await loadRazorpayScript();
-
-  if (!scriptLoaded) {
-    throw new Error(
-      "Could not load the payment window. Check your internet connection."
-    );
-  }
-
-  return new Promise((resolve, reject) => {
-    const checkout = new window.Razorpay({
-      key: order.razorpayKeyId, // public key only
-      // From the server's order, not from anything the page held.
-      amount: order.amountInPaise,
-      currency: order.currency,
-      order_id: order.orderId,
-
-      name: "CardioCare",
-      description: `Consultation with ${doctorName || "your doctor"}`,
-
-      prefill: { email: user.email || "" },
-
-      // ---- 3. Razorpay returns a SIGNED result ---------
-      handler: async (response) => {
-        try {
-          // ---- 4. only the server may accept it --------
-          const verifyResponse = await fetch(`${API_URL}/payments/verify`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              paymentDocId: order.paymentDocId,
-              razorpayOrderId: response.razorpay_order_id,
-              razorpayPaymentId: response.razorpay_payment_id,
-              razorpaySignature: response.razorpay_signature,
-            }),
-          });
-
-          if (!verifyResponse.ok) {
-            const problem = await verifyResponse.json().catch(() => null);
-
-            reject(
-              new Error(
-                problem?.detail ||
-                  "We could not verify your payment. If money was deducted " +
-                    "it will be refunded automatically. Please contact support."
-              )
-            );
-            return;
-          }
-
-          const verified = await verifyResponse.json();
-
-          resolve({ status: verified.status, paymentDocId: order.paymentDocId });
-        } catch {
-          reject(
-            new Error(
-              "Payment was taken but could not be confirmed. Please do not " +
-                "pay again - check your consultation status in a moment."
-            )
-          );
-        }
-      },
-
-      modal: {
-        ondismiss: () => resolve({ status: "cancelled" }),
-      },
-    });
-
-    checkout.on("payment.failed", (event) => {
-      reject(
-        new Error(
-          event?.error?.description || "The payment could not be completed."
-        )
-      );
-    });
-
-    checkout.open();
-  });
 };
 
-// -----------------------------------------------------
-// READ
-// -----------------------------------------------------
+export const subscribeDemoPayments = (onChange) => {
+  if (typeof window === "undefined") return () => {};
+  window.addEventListener("storage", onChange);
+  window.addEventListener("cardiocare-demo-payment-change", onChange);
 
-export const getMyPayments = async () => {
-  const user = auth.currentUser;
-
-  if (!user) throw new Error("You must be signed in.");
-
-  const snapshot = await getDocs(
-    query(collection(db, "payments"), where("patientId", "==", user.uid))
-  );
-
-  return snapshot.docs
-    .map((d) => ({ id: d.id, ...d.data() }))
-    .sort(
-      (a, b) =>
-        (b.createdAt?.toMillis?.() ?? 0) - (a.createdAt?.toMillis?.() ?? 0)
-    );
+  return () => {
+    window.removeEventListener("storage", onChange);
+    window.removeEventListener("cardiocare-demo-payment-change", onChange);
+  };
 };
+
+export const payForConsultation = async ({ requestId, consultation = {} }) => {
+  if (!requestId) throw new Error("Consultation reference is missing.");
+
+  const existingPayment = getDemoPayment(requestId);
+  if (existingPayment) return existingPayment;
+
+  await delay(1200);
+
+  const paidAt = new Date().toISOString();
+  const payment = {
+    status: "PAID",
+    paymentMethod: "DEMO",
+    requestId,
+    fee: DEMO_FEE,
+    paidAt,
+    transactionReference: `DEMO-${Date.now().toString(36).toUpperCase()}`,
+    doctorName: consultation.doctorName || "",
+    hospitalName: consultation.hospitalName || "",
+    consultationDate:
+      consultation.completedAt?.toDate?.()?.toISOString?.() ||
+      consultation.createdAt?.toDate?.()?.toISOString?.() ||
+      "",
+  };
+
+  try {
+    window.localStorage.setItem(paymentKey(requestId), JSON.stringify(payment));
+  } catch (error) {
+    const storageError = new Error(
+      "The demo payment could not be saved in this browser. Check local storage settings and try again."
+    );
+    storageError.cause = error;
+    throw storageError;
+  }
+
+  window.dispatchEvent?.(new Event("cardiocare-demo-payment-change"));
+  return payment;
+};
+
+const escapeHtml = (value) =>
+  String(value).replace(/[&<>"']/g, (character) => {
+    const entities = {
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;",
+    };
+    return entities[character];
+  });
+
+export const downloadDemoReceipt = (payment) => {
+  if (!payment?.requestId || payment.status !== "PAID") {
+    throw new Error("A successful demo payment is required for a receipt.");
+  }
+
+  const paidDate = new Date(payment.paidAt);
+  if (Number.isNaN(paidDate.getTime())) {
+    throw new Error("The saved demo payment date is invalid.");
+  }
+
+  const receiptDate = escapeHtml(paidDate.toLocaleString());
+  const reference = escapeHtml(payment.requestId);
+  const doctor = escapeHtml(payment.doctorName || "Not available in this demo");
+  const transaction = escapeHtml(payment.transactionReference);
+
+  const receipt = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CardioCare Demo Receipt</title>
+  <style>
+    body { font: 16px Arial, sans-serif; color: #172033; margin: 0; padding: 32px; }
+    main { max-width: 620px; margin: 0 auto; border: 1px solid #cbd5e1; border-radius: 12px; padding: 28px; }
+    h1 { margin-top: 0; color: #0f766e; }
+    .notice { background: #fff7ed; border: 1px solid #fdba74; padding: 12px; font-weight: 700; }
+    dl { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    dt { color: #64748b; font-size: 13px; } dd { margin: 4px 0 0; overflow-wrap: anywhere; }
+    .amount { font-size: 22px; font-weight: 700; }
+    @media print { body { padding: 0; } main { border: 0; } }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>CardioCare Medical Center</h1>
+    <p class="notice">DEMO RECEIPT — NOT A REAL FINANCIAL TRANSACTION</p>
+    <dl>
+      <div><dt>Consultation reference</dt><dd>${reference}</dd></div>
+      <div><dt>Doctor</dt><dd>${doctor}</dd></div>
+      <div><dt>Fee</dt><dd class="amount">₹${DEMO_FEE}</dd></div>
+      <div><dt>Payment date and time</dt><dd>${receiptDate}</dd></div>
+      <div><dt>Demo transaction reference</dt><dd>${transaction}</dd></div>
+      <div><dt>Payment status</dt><dd>PAID — DEMO ONLY</dd></div>
+    </dl>
+  </main>
+</body>
+</html>`;
+
+  const blob = new Blob([receipt], { type: "text/html;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `cardiocare-demo-receipt-${encodeURIComponent(payment.requestId)}.html`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+};
+
+export const DEMO_PAYMENT_FEE = DEMO_FEE;

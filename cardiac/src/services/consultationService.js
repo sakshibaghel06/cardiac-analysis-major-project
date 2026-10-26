@@ -371,11 +371,15 @@ they could not see the existence of.
 */
 export const completeConsultation = async (
   requestId,
-  prescriptionStatus = PRESCRIPTION_STATE.NONE
+  prescriptionStatus = PRESCRIPTION_STATE.NONE,
+  prescriptionId = null
 ) => {
   await updateDoc(doc(db, "consultation_requests", requestId), {
     status: STATUS.COMPLETED,
     prescriptionStatus,
+    ...(prescriptionStatus === PRESCRIPTION_STATE.ISSUED && prescriptionId
+      ? { prescriptionId }
+      : {}),
     completedAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   });
@@ -388,6 +392,15 @@ without changing the consultation's own status.
 export const setPrescriptionState = async (requestId, prescriptionStatus) => {
   await updateDoc(doc(db, "consultation_requests", requestId), {
     prescriptionStatus,
+    updatedAt: serverTimestamp(),
+  });
+};
+
+export const linkIssuedPrescription = async (requestId, prescriptionId) => {
+  if (!auth.currentUser) throw new Error("You must be signed in.");
+
+  await updateDoc(doc(db, "consultation_requests", requestId), {
+    prescriptionId,
     updatedAt: serverTimestamp(),
   });
 };

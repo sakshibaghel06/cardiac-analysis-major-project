@@ -22,6 +22,50 @@ body {
   color: var(--text);
 }
 
+.startup-screen {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.startup-card {
+  width: min(100%, 680px);
+  padding: clamp(24px, 5vw, 48px);
+  border: 1px solid #d7edf2;
+  border-radius: 24px;
+  background: #fff;
+  box-shadow: var(--shadow);
+  line-height: 1.7;
+}
+
+.startup-card h1 {
+  margin: 12px 0;
+  font-size: clamp(24px, 4vw, 32px);
+}
+
+.startup-card p,
+.startup-card li {
+  margin-top: 12px;
+}
+
+.startup-card ul {
+  padding-left: 24px;
+}
+
+.startup-card code {
+  overflow-wrap: anywhere;
+  color: #165b70;
+}
+
+.startup-brand {
+  color: #227e92;
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
 .auth-container {
   min-height: 100vh;
   display: flex;
@@ -8336,6 +8380,24 @@ body {
   cursor: not-allowed;
 }
 
+.pay-spinner {
+  display: inline-block;
+  width: 13px;
+  height: 13px;
+  margin-right: 8px;
+  border: 2px solid rgba(255, 255, 255, 0.45);
+  border-top-color: #ffffff;
+  border-radius: 50%;
+  vertical-align: -2px;
+  animation: pay-spinner-rotate 0.7s linear infinite;
+}
+
+@keyframes pay-spinner-rotate {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .pay-secondary {
   display: block;
   width: 100%;
@@ -8392,7 +8454,7 @@ body {
   color: var(--cc-high, #a33a3a);
 }
 
-.pay-testmode {
+.pay-demo-notice {
   margin-bottom: 16px;
   padding: 10px 14px;
   border-radius: 10px;

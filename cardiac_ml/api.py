@@ -6,7 +6,7 @@ CardioCare - prediction API
 Serves the Random Forest pipeline trained by train_model.py.
 
 Run:
-    uvicorn api:app --reload --port 8000
+    uvicorn api:app --reload --host 127.0.0.1 --port 8001
 or:
     python api.py
 
@@ -79,20 +79,6 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
-
-# ---------------------------------------------------------------------
-# PAYMENTS
-# ---------------------------------------------------------------------
-#
-# Mounted on the same service so the demo only needs one process
-# running. Payment verification is deliberately server-side: see
-# payments.py for why the browser is never allowed to decide that a
-# payment succeeded.
-
-from payments import router as payments_router  # noqa: E402
-
-app.include_router(payments_router)
-
 
 # ---------------------------------------------------------------------
 # REQUEST SCHEMA
@@ -235,4 +221,4 @@ def predict(patient: PatientInput):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8001)

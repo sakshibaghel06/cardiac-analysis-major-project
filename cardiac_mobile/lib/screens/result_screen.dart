@@ -17,11 +17,13 @@ class ResultScreen extends StatelessWidget {
     required this.result,
     required this.features,
     this.emergencySymptoms = const [],
+    this.assessmentId,
   });
 
   final RiskResult result;
   final Map<String, int> features;
   final List<String> emergencySymptoms;
+  final String? assessmentId;
 
   String get _headline => switch (result.risk.toUpperCase()) {
         'LOW' => 'Lower estimated risk',
@@ -239,6 +241,7 @@ class ResultScreen extends StatelessWidget {
                   builder: (_) => DoctorListScreen(
                     risk: result.risk,
                     features: features,
+                    assessmentId: assessmentId,
                   ),
                 ),
               ),

@@ -94,8 +94,8 @@ await testEnv.withSecurityRulesDisabled(async (context) => {
       was once a cross-document lookup to the consultation, but a
       rule that reads another document cannot be satisfied by a list
       query - so one locked row denied the patient's entire
-      dashboard. Only the server sets this, after verifying the
-      Razorpay signature.
+      dashboard. It is set only alongside the consultation's
+      persisted payment status.
     */
     unlocked: true,
     medicines: [],

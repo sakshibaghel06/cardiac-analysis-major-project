@@ -9,7 +9,7 @@ validation, and the risk bands.
 
 Start the API first, then:
 
-    python -m uvicorn api:app --port 8000     (terminal 1)
+    python -m uvicorn api:app --host 127.0.0.1 --port 8001     (terminal 1)
     python test_api.py                        (terminal 2)
 
 Exits non-zero if anything fails.
@@ -21,7 +21,7 @@ import sys
 import urllib.error
 import urllib.request
 
-BASE = "http://127.0.0.1:8000"
+BASE = "http://127.0.0.1:8001"
 
 passed = 0
 failed = 0
@@ -179,21 +179,6 @@ check(
 )
 
 # ---------------------------------------------------------------
-print("\n--- payments endpoint ---")
-
-status, config, _ = call("/payments/config")
-
-check("GET /payments/config returns 200", status == 200)
-check(
-    "reports configuration honestly rather than faking it",
-    isinstance(config.get("configured"), bool),
-    str(config),
-)
-
-if not config.get("configured"):
-    print("  NOTE: Razorpay keys are not set, so payment is correctly")
-    print("  reported as unconfigured. Live payment is NOT VERIFIED.")
-
 # ---------------------------------------------------------------
 print("\n" + "=" * 62)
 print(f"PASSED: {passed}    FAILED: {failed}")

@@ -8,6 +8,7 @@
   "FIREBASE_IOS_BUNDLE_ID": "com.cardiocare.cardiacMobile",
 
   "PREDICTION_API_URL": "http://10.0.2.2:8000",
+  "DEFAULT_CONSULTATION_FEE": "500",
 
   "TURN_URL": "",
   "TURN_USERNAME": "",

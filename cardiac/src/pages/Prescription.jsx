@@ -1,5 +1,10 @@
-import { useCallback, useEffect, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import {
+  useCallback,
+  useEffect,
+  useState,
+  useSyncExternalStore,
+} from "react";
+import { useLocation, useNavigate, useParams } from "react-router-dom";
 
 import { useAuth } from "../context/useAuth";
 
@@ -16,10 +21,16 @@ import {
   PRESCRIPTION_STATE,
   completeConsultation,
   getConsultationRequest,
+  linkIssuedPrescription,
   setPrescriptionState,
 } from "../services/consultationService";
 
 import { downloadPrescriptionPdf } from "../services/prescriptionPdf";
+import {
+  getDemoPaymentSnapshot,
+  parseDemoPayment,
+  subscribeDemoPayments,
+} from "../services/paymentService";
 
 /*
 =====================================================
@@ -39,6 +50,7 @@ a diagnosis or a medicine; every word is the doctor's.
 
 function Prescription() {
   const { requestId } = useParams();
+  const location = useLocation();
   const navigate = useNavigate();
   const { user, role, profile, loading: authLoading } = useAuth();
 
@@ -49,7 +61,20 @@ function Prescription() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const [prescriptionLoadError, setPrescriptionLoadError] = useState("");
   const [flash, setFlash] = useState("");
+  const storedPayment = useSyncExternalStore(
+    subscribeDemoPayments,
+    () => getDemoPaymentSnapshot(requestId),
+    () => null
+  );
+  let localDemoPaid = false;
+  let demoPaymentError = "";
+  try {
+    localDemoPaid = parseDemoPayment(storedPayment, requestId)?.status === "PAID";
+  } catch (storageError) {
+    demoPaymentError = storageError.message;
+  }
 
   const [diagnosis, setDiagnosis] = useState("");
   const [notes, setNotes] = useState("");
@@ -66,7 +91,28 @@ function Prescription() {
   // ---------------------------------------------------
 
   const fetchAll = useCallback(async () => {
-    const consultation = await getConsultationRequest(requestId);
+    let consultation;
+    let consultationReadError;
+
+    try {
+      consultation = await getConsultationRequest(requestId);
+    } catch (readError) {
+      consultationReadError = readError;
+      const routeConsultation = location.state?.consultation;
+      if (
+        routeConsultation?.id === requestId &&
+        routeConsultation.patientId === user?.uid
+      ) {
+        consultation = routeConsultation;
+      } else if (role === "patient" && localDemoPaid) {
+        consultation = { id: requestId, patientId: user.uid };
+      } else {
+        throw new Error(
+          "Consultation details could not be loaded from Firebase. Return to My Consultations and open this prescription from its record.",
+          { cause: readError }
+        );
+      }
+    }
 
     if (!consultation) throw new Error("This consultation could not be found.");
 
@@ -84,10 +130,41 @@ function Prescription() {
       query. Without it Firestore refuses the read outright -
       rules are not filters. See prescriptionService.
     */
-    const prescriptions = await getPrescriptionsForRequest(requestId, role);
+    let prescriptions = [];
+    let prescriptionReadError = null;
+    try {
+      prescriptions = await getPrescriptionsForRequest(requestId, role);
+    } catch (readError) {
+      prescriptionReadError = readError;
+    }
+    let linkedConsultation = consultation;
 
-    return { consultation, prescriptions };
-  }, [requestId, user, role]);
+    if (
+      role === "doctor" &&
+      consultation.prescriptionStatus === PRESCRIPTION_STATE.ISSUED &&
+      !consultation.prescriptionId
+    ) {
+      const issuedPrescriptions = prescriptions.filter(
+        (prescription) =>
+          prescription.status === PRESCRIPTION_STATUS.ISSUED
+      );
+
+      if (issuedPrescriptions.length === 1) {
+        await linkIssuedPrescription(requestId, issuedPrescriptions[0].id);
+        linkedConsultation = {
+          ...consultation,
+          prescriptionId: issuedPrescriptions[0].id,
+        };
+      }
+    }
+
+    return {
+      consultation: linkedConsultation,
+      prescriptions,
+      prescriptionReadError,
+      consultationReadError,
+    };
+  }, [requestId, user, role, location.state, localDemoPaid]);
 
   useEffect(() => {
     if (authLoading || !user || !role) return undefined;
@@ -96,12 +173,30 @@ function Prescription() {
 
     (async () => {
       try {
-        const { consultation, prescriptions } = await fetchAll();
+        const {
+          consultation,
+          prescriptions,
+          prescriptionReadError,
+          consultationReadError,
+        } = await fetchAll();
 
         if (cancelled) return;
 
         setRequest(consultation);
         setExisting(prescriptions);
+        if (prescriptionReadError) {
+          console.error(prescriptionReadError);
+          setPrescriptionLoadError(
+            "The prescription record could not be loaded from Firebase. Your local demo payment does not change Firebase permissions or unlock the stored prescription."
+          );
+        } else if (consultationReadError) {
+          setPrescriptionLoadError(
+            consultation.patientId === user.uid &&
+              location.state?.consultation?.id === requestId
+              ? "Firebase consultation details could not be loaded. Showing the consultation details passed from My Consultations."
+              : "Firebase consultation details could not be loaded. The local demo payment is visible, but it does not provide or unlock consultation or prescription records."
+          );
+        }
 
         // Reopen an unfinished draft rather than starting blank.
         const openDraft = prescriptions.find(
@@ -138,7 +233,14 @@ function Prescription() {
     return () => {
       cancelled = true;
     };
-  }, [authLoading, user, role, fetchAll]);
+  }, [
+    authLoading,
+    user,
+    role,
+    fetchAll,
+    requestId,
+    location.state?.consultation?.id,
+  ]);
 
   /*
     Live updates, so a patient sitting on this page sees the
@@ -152,8 +254,12 @@ function Prescription() {
       requestId,
       role,
       (items) => setExisting(items),
-      (watchError) =>
-        console.warn("Prescription listener:", watchError.code || watchError)
+      (watchError) => {
+        console.warn("Prescription listener:", watchError.code || watchError);
+        setPrescriptionLoadError(
+          "The prescription record could not be loaded from Firebase. Your local demo payment does not change Firebase permissions or unlock the stored prescription."
+        );
+      }
     );
   }, [authLoading, user, role, requestId]);
 
@@ -228,7 +334,7 @@ function Prescription() {
       setDraftId(id);
 
       if (issue) {
-        await completeConsultation(requestId, PRESCRIPTION_STATE.ISSUED);
+        await completeConsultation(requestId, PRESCRIPTION_STATE.ISSUED, id);
         setFlash("Prescription issued. Your patient can now see it.");
       } else {
         await setPrescriptionState(requestId, PRESCRIPTION_STATE.DRAFT);
@@ -283,11 +389,14 @@ function Prescription() {
     );
   }
 
-  const paid = request?.paymentStatus === "paid";
+  const paid =
+    request?.paymentStatus === "paid" ||
+    (role === "patient" && localDemoPaid);
   const feeDue = Number(request?.fee) > 0;
   const issuedButLocked =
     !isDoctor &&
     !issued &&
+    !paid &&
     request?.prescriptionStatus === PRESCRIPTION_STATE.ISSUED;
 
   return (
@@ -313,6 +422,12 @@ function Prescription() {
         {flash && (
           <div className="rx-success" role="status">
             {flash}
+          </div>
+        )}
+
+        {(prescriptionLoadError || demoPaymentError) && (
+          <div className="rx-error" role="status">
+            {prescriptionLoadError || demoPaymentError}
           </div>
         )}
 
@@ -437,6 +552,28 @@ function Prescription() {
               onClick={() => navigate("/patient/dashboard")}
             >
               Back to Dashboard
+            </button>
+          </div>
+        )}
+
+        {!isDoctor && paid && !issued && (
+          <div className="rx-locked">
+            <h2>Demo payment status: PAID</h2>
+            {localDemoPaid && (
+              <p>
+                This payment is stored only in this browser. It does not
+                update Firebase or change its prescription access rules.
+              </p>
+            )}
+            <p>
+              {prescriptionLoadError ||
+                "No unlocked prescription record was returned from Firebase. A local demo payment cannot unlock the stored prescription, so no prescription content is available to show here."}
+            </p>
+            <button
+              className="rx-secondary"
+              onClick={() => navigate("/consultations")}
+            >
+              Back to My Consultations
             </button>
           </div>
         )}

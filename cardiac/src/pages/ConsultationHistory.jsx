@@ -14,6 +14,7 @@ import {
 } from "../services/consultationService";
 
 import { getMyPrescriptions } from "../services/prescriptionService";
+import { getDemoPayment } from "../services/paymentService";
 
 /*
 =====================================================
@@ -216,7 +217,17 @@ function ConsultationHistory() {
               const status = consultation.status;
               const prescription = prescriptionFor(consultation.id);
               const busy = busyId === consultation.id;
-              const paid = consultation.paymentStatus === "paid";
+              let localDemoPayment = null;
+              try {
+                localDemoPayment = getDemoPayment(consultation.id);
+              } catch (storageError) {
+                console.error("Could not read local demo payment:", storageError);
+              }
+              const localDemoPaid = localDemoPayment?.status === "PAID";
+              const paid =
+                consultation.paymentStatus === "paid" || localDemoPaid;
+              const hasIssuedPrescription =
+                consultation.prescriptionStatus === "issued";
 
               /*
                 Payment is the LAST step:
@@ -273,13 +284,23 @@ function ConsultationHistory() {
                             paid ? "paid" : "unpaid"
                           }`}
                         >
-                          {paid ? "Paid" : `₹${consultation.fee} due`}
+                          {localDemoPaid
+                            ? "PAID · DEMO (this browser)"
+                            : paid
+                            ? "Paid"
+                            : `₹${consultation.fee} due`}
                         </span>
                       )}
                     </div>
                   </div>
 
                   <p className="history-help">{helpFor(status)}</p>
+                  {localDemoPaid && (
+                    <p className="history-help">
+                      Demo payment is saved only in this browser; Firebase
+                      payment status has not changed.
+                    </p>
+                  )}
 
                   <div className="history-actions">
                     {isJoinable(status) && (
@@ -295,7 +316,11 @@ function ConsultationHistory() {
                     {/* Last step: settle the fee after the consultation. */}
                     {needsPayment && (
                       <button
-                        onClick={() => navigate(`/payment/${consultation.id}`)}
+                        onClick={() =>
+                          navigate(`/payment/${consultation.id}`, {
+                            state: { consultation },
+                          })
+                        }
                         disabled={busy}
                       >
                         {busy
@@ -314,11 +339,14 @@ function ConsultationHistory() {
                       </button>
                     )}
 
-                    {prescription && (
+                    {(prescription ||
+                      (localDemoPaid && hasIssuedPrescription)) && (
                       <button
                         className="history-secondary"
                         onClick={() =>
-                          navigate(`/prescription/${consultation.id}`)
+                          navigate(`/prescription/${consultation.id}`, {
+                            state: { consultation },
+                          })
                         }
                       >
                         View Prescription

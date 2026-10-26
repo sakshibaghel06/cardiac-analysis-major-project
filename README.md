@@ -3,8 +3,9 @@
 **AI-Based Cardiovascular Risk Prediction and Emergency Tele-Consultation System**
 
 A patient completes a cardiac risk screening, receives a machine-learning risk
-estimate, requests a consultation with a doctor, pays the fee, meets the doctor
-over video, and receives a prescription — all through one Firebase backend.
+estimate, requests a consultation with a doctor, completes a clearly labeled
+demo payment, meets the doctor over video, and receives a prescription — all
+through one Firebase backend.
 
 > **Not a medical device.** The model is a screening aid trained on a public
 > research dataset. It is not validated for clinical use and cannot diagnose
@@ -34,14 +35,11 @@ cardiac-analysis/
 ├── cardiac_ml/             Python — model + API
 │   ├── train_model.py      reproducible training pipeline
 │   ├── api.py              FastAPI prediction service
-│   ├── payments.py         server-side payment verification
 │   ├── test_api.py         API integration test
-│   ├── test_payment_security.py  payment unit test
 │   ├── model.pkl           deployed sklearn Pipeline
 │   ├── model_meta.json     feature schema + risk thresholds
 │   ├── metrics.json        every measured score
 │   ├── FEATURE_ANALYSIS.md feature feasibility + model report
-│   ├── .env.example        server-side config (Razorpay, Admin SDK)
 │   └── dataset/            UCI Heart Disease (Cleveland)
 │
 ├── cardiac_mobile/         Flutter patient app (optional, same Firebase project)
@@ -52,7 +50,7 @@ cardiac-analysis/
 │   ├── seed_firestore.mjs      doctor roles + fees (dry run by default)
 │   └── seed.config.example.json  copy to seed.config.json
 │
-├── tests/rules.test.mjs    76 security-rule tests
+├── tests/rules.test.mjs    99 security-rule tests
 ├── firestore.rules         access control
 ├── firestore.indexes.json  composite indexes
 ├── firebase.json           emulator + deploy config
@@ -72,18 +70,26 @@ cd cardiac-analysis
 ```
 
 ```powershell
-cd cardiac_ml ; python -m venv venv ; .\venv\Scripts\pip install -r requirements.txt
+cd cardiac_ml
+python -m venv venv
+.\venv\Scripts\python -m pip install -r requirements.txt
 ```
 
 ```powershell
-cd ..\cardiac ; npm install ; copy .env.example .env
+cd ..\cardiac
+npm install
+if (-not (Test-Path .\.env)) {
+    Copy-Item .\.env.example .\.env
+} else {
+    Write-Host "Keeping the existing .env."
+}
 ```
 
 Open `cardiac\.env` in a text editor and fill in the six `VITE_FIREBASE_*`
 values. Then, in **two separate terminals**:
 
 ```powershell
-cd cardiac_ml ; .\venv\Scripts\python -m uvicorn api:app --port 8000
+cd cardiac_ml ; .\venv\Scripts\python -m uvicorn api:app --host 127.0.0.1 --port 8001
 ```
 
 ```powershell
@@ -107,7 +113,7 @@ and tested against.
 | **Node.js** | 20 LTS or newer | React app, test scripts, Firebase CLI | <https://nodejs.org> — take the LTS **.msi** |
 | **Python** | 3.11 – 3.13 | ML API and model training | <https://python.org/downloads> |
 | **Git** | any recent | cloning, committing | <https://git-scm.com/download/win> |
-| **Java JDK** | 11 or newer | *only* to run the Firestore emulator for `npm run test:rules` | <https://adoptium.net> |
+| **Java JDK** | 21 recommended; use JDK 17 or 21 for Android builds | Firestore emulator and Flutter Android build | <https://adoptium.net> |
 | **Firebase CLI** | 13+ | deploying rules, running the emulator | `npm install -g firebase-tools` |
 | **Flutter** | 3.x | *only* if you work on `cardiac_mobile/` | <https://docs.flutter.dev/get-started/install/windows> |
 
@@ -150,7 +156,7 @@ activate the virtual environment at all — call the interpreter by path, as
 every command in this README does:
 
 ```powershell
-.\venv\Scripts\python -m uvicorn api:app --port 8000
+.\venv\Scripts\python -m uvicorn api:app --host 127.0.0.1 --port 8001
 ```
 
 If you prefer activation, allow it for your own user only:
@@ -171,18 +177,22 @@ dataset yourself (reproducible, `random_state = 42` throughout):
 ```powershell
 cd ..\cardiac
 npm install
-copy .env.example .env
+if (-not (Test-Path .\.env)) {
+    Copy-Item .\.env.example .\.env
+} else {
+    Write-Host "Keeping the existing .env."
+}
 ```
 
 > `cp` is not a Windows command — use `copy` in PowerShell and cmd. In Git
 > Bash, `cp .env.example .env` works.
 
 Now edit `cardiac\.env` and fill in the Firebase values —
-see [Credentials each teammate needs](#credentials-each-teammate-needs).
+see [Firebase web configuration](#firebase-web-configuration).
 
-The app **refuses to start** with an incomplete Firebase config, and names the
-missing keys. That is deliberate: the alternative is a confusing
-`auth/invalid-api-key` or `permission-denied` several screens later.
+With an incomplete Firebase config the app displays a setup screen listing
+the missing keys instead of failing before React mounts. Authentication and
+patient data remain unavailable until the authorized web-app config is set.
 
 ### 4. Run both halves
 
@@ -191,7 +201,7 @@ browser, so the API must be running first.
 
 | Terminal | Command | Serves |
 |---|---|---|
-| 1 | `cd cardiac_ml` → `.\venv\Scripts\python -m uvicorn api:app --port 8000` | ML API |
+| 1 | `cd cardiac_ml` → `.\venv\Scripts\python -m uvicorn api:app --host 127.0.0.1 --port 8001` | ML API |
 | 2 | `cd cardiac` → `npm run dev` | React app |
 
 ### 5. Deploy the security rules and indexes
@@ -201,13 +211,17 @@ anyone who has the project ID — which is shipped in every browser bundle.
 
 ```powershell
 firebase login
-firebase use cardiac-analysis
+# First verify the authorized project ID with its owner; do not assume the
+# repository's .firebaserc alias is the intended project.
+firebase projects:list
+# Replace this with the verified project ID before running:
+firebase use YOUR_AUTHORIZED_PROJECT_ID
 firebase deploy --only firestore:rules,firestore:indexes
 ```
 
 Only one teammate needs to do this, and only when `firestore.rules` or
 `firestore.indexes.json` changes. It affects the shared Firebase project, so
-agree on it before running it.
+confirm the selected project and get approval before deploying.
 
 ---
 
@@ -216,7 +230,7 @@ agree on it before running it.
 | Port | Process | Started by | Notes |
 |---|---|---|---|
 | **5173** | Vite dev server | `npm run dev` | Vite silently moves to **5174** if taken — read the URL it prints |
-| **8000** | FastAPI ML + payments API | `uvicorn api:app --port 8000` | `VITE_ML_API_URL` must match |
+| **8001** | FastAPI prediction API | `uvicorn api:app --host 127.0.0.1 --port 8001` | `VITE_ML_API_URL` must match |
 | **8080** | Firestore emulator | `npm run test:rules` | test only |
 | **9099** | Auth emulator | emulator suite | test only |
 | **4000** | Emulator UI | emulator suite | test only |
@@ -227,13 +241,7 @@ on the API process or the browser will block every call.
 
 ---
 
-## Credentials each teammate needs
-
-There are three separate things, and they are not equally secret. Treating
-them the same is the usual source of either a leaked key or a blocked
-teammate.
-
-### 1. Firebase web config — needed by everyone, not secret
+## Firebase web configuration
 
 Six values, in `cardiac\.env`:
 
@@ -255,127 +263,70 @@ designed to be public. What protects the data is `firestore.rules`, not
 hiding these values. They live in `.env` only so a development project and a
 production project can be swapped without editing code.
 
-So it is fine to paste them to a teammate over chat. It is still **not** fine
-to commit `.env` — not because the values are secret, but because the file is
-per-environment, and the habit is what keeps the genuinely secret files below
-out of the repository.
+Do not commit `.env`; it is per-environment. Demo payment needs no gateway
+secrets or server-side credentials.
 
-### 2. Razorpay keys — server-side only, genuinely secret
+## Demo payment — no gateway setup
 
-Needed **only** to exercise the payment step. Everything else — risk
-prediction, consultations, video, prescriptions — runs without them.
+The prescription payment page simulates a payment for the consultation fee
+(₹500) and clearly labels it **DEMO PAYMENT — No real money will be charged.**
+After a short delay, it stores a DEMO PAID status in this browser's local
+storage, keyed by consultation reference. Refreshing in the same browser keeps
+that status; it does not update Firestore or synchronize to other browsers.
 
-| Variable | Secret? | Purpose |
-|---|---|---|
-| `RAZORPAY_KEY_ID` | No — the browser receives it | Identifies the account |
-| `RAZORPAY_KEY_SECRET` | **Yes** | Signs and verifies payments |
-| `RAZORPAY_WEBHOOK_SECRET` | **Yes** | Verifies webhook callbacks |
+The page can create and download a printable HTML receipt. The receipt is
+marked **DEMO RECEIPT — NOT A REAL FINANCIAL TRANSACTION**. A local demo payment
+does not change Firebase prescription permissions; if the actual prescription
+cannot be read, the app explains that instead of showing invented content.
+Pay Later does not mark the consultation paid.
 
-**Get them:** <https://dashboard.razorpay.com> → *Account & Settings* →
-*API Keys* → *Generate Test Key*. The secret is shown **once**.
-
-Each teammate needs their **own test keys** from their own Razorpay account,
-or one shared test account whose secret is sent through something better than
-a group chat. Never put them in a `VITE_` variable — that publishes them.
-
-### 3. Firebase service-account JSON — most secret of all
-
-Needed only to **record** a payment. The payment endpoints write to Firestore
-with admin credentials, which is exactly why `firestore.rules` can forbid
-every client write to `/payments` — a browser can never mark itself paid.
-
-**Get it:** Firebase Console → ⚙ Project settings → *Service accounts* →
-*Generate new private key*.
-
-This file **bypasses every security rule.** Store it outside the repository,
-never commit it, and never send it over chat. Point the API at it with
-`GOOGLE_APPLICATION_CREDENTIALS`.
-
-### Configuring the payment API
-
-The API does **not** read a `.env` file — there is no `python-dotenv`
-dependency. Set the variables in the shell that starts uvicorn, in the same
-terminal, before the server command:
-
-```powershell
-$env:RAZORPAY_KEY_ID = "rzp_test_xxxxxxxxxxxxx"
-$env:RAZORPAY_KEY_SECRET = "your_test_secret"
-$env:GOOGLE_APPLICATION_CREDENTIALS = "C:\Users\you\secrets\cardiac-adminsdk.json"
-.\venv\Scripts\python -m uvicorn api:app --port 8000
-```
-
-`$env:` assignments last only for that terminal window. Set them again each
-time, or add them to your Windows user environment variables.
-
-`cardiac_ml\.env.example` documents every server-side variable. Copy it to
-`cardiac_ml\.env` as your own record of what you have set — the API will not
-read it, but you will not have to remember.
-
-### What payments can and cannot do
-
-Be clear about this before demoing:
-
-- **Without Razorpay keys** — `GET /payments/config` honestly returns
-  `{"configured": false}` and the UI says payment is unavailable. It never
-  pretends a payment succeeded. Everything else works.
-- **With test keys** (`rzp_test_...`) — the full checkout flow works end to
-  end and signatures verify, but **no real money moves.** Use Razorpay's
-  published test card numbers. This is what teammates should use.
-- **With `firebase-admin` missing or no service-account JSON** — checkout
-  still signs correctly, but recording the payment returns HTTP 503.
-  `firebase-admin` is in `requirements.txt`; the JSON key is not and cannot be.
-- **Live payments** (`rzp_live_...`) need a Razorpay account that has
-  completed **KYC/business verification**, which takes days and requires
-  business documents. **Cloning this repository does not give anyone the
-  ability to take real payments**, and nothing in this setup should be
-  described as doing so.
+No payment gateway, webhooks, Firebase Admin service account, backend payment
+endpoint, or Firestore rules deployment is needed for the demo payment.
+Firebase Authentication and Firestore remain in use for the app's existing
+patient, doctor, consultation, and prescription features.
 
 ---
 
 ## Running the tests
 
-All five suites, from a fresh clone. 179 assertions total, all passing.
+Run the suites below to verify the current checkout.
 
 ### Frontend logic — no setup needed
 
 ```powershell
-cd cardiac
+Set-Location .\cardiac
+node scripts/test_firebase_startup.mjs
 node scripts/test_assessment_encoding.mjs
 node scripts/test_consultation_status.mjs
 node scripts/test_prescription_pdf.mjs
 ```
 
-28 + 17 + 14 assertions. Plain Node, no test runner, no services required.
-
-### Payment security — no credentials needed
-
-```powershell
-cd cardiac_ml
-.\venv\Scripts\python test_payment_security.py
-```
-
-21 assertions: signature verification, webhook raw-body hashing, replay
-rejection, idempotency, payout routing. Uses fixed dummy secrets, so it needs
-no Razorpay account.
+3 + 28 + 17 + 14 assertions. Plain Node, no test runner or services required.
 
 ### ML API — needs the API running
 
 ```powershell
 cd cardiac_ml
-.\venv\Scripts\python -m uvicorn api:app --port 8000     # terminal 1
-.\venv\Scripts\python test_api.py                        # terminal 2
+.\venv\Scripts\python -m uvicorn api:app --host 127.0.0.1 --port 8001    # terminal 1
+.\venv\Scripts\python test_api.py                                            # terminal 2
 ```
 
-23 assertions: liveness, CORS, predictions against rows with known ground
+21 assertions: liveness, CORS, predictions against rows with known ground
 truth, server-side input validation, risk bands.
 
 ### Firestore security rules — needs Java
+
+Install the test dependencies once from the repository root:
+
+```powershell
+npm install --prefix tests
+```
 
 ```powershell
 npm run test:rules
 ```
 
-76 assertions against the Firestore emulator. This is the suite that matters
+99 assertions against the Firestore emulator. This is the suite that matters
 most: it is what proves a patient cannot read another patient's records.
 
 ### Lint and production build
@@ -399,16 +350,15 @@ steps that need two signed-in accounts.
 | `running scripts is disabled on this system` | PowerShell execution policy | Skip activation — call `.\venv\Scripts\python` directly; or `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` |
 | `'firebase' is not recognized` — including from `npm run test:rules` | Global npm bin not on `PATH` | Reopen the terminal. If it persists, add `%APPDATA%\npm` to `PATH` |
 | `Firebase configuration is incomplete. Missing: ...` | No `.env`, or blank values | `copy .env.example .env` in `cardiac\` and fill in the six Firebase values. **Restart `npm run dev`** — Vite reads `.env` only at startup |
-| App loads, risk assessment fails with a network error | ML API not running, or on another port | Start uvicorn on 8000; check `VITE_ML_API_URL` matches |
+| App loads, risk assessment fails with a network error | ML API not running, or on another port | Start uvicorn on 8001; check `VITE_ML_API_URL` matches |
 | Risk assessment fails, console shows a CORS error | Frontend on an origin the API does not allow | Vite moved to 5174 — already allowed — or set `CARDIAC_ALLOWED_ORIGINS` on the API |
 | `model.pkl / model_meta.json not found` | Running uvicorn from the wrong folder | `cd cardiac_ml` first |
 | `permission-denied` from Firestore | Rules not deployed, or the doctor doc is keyed wrong | `firebase deploy --only firestore:rules`; a doctor's document ID **must be** their Auth UID |
 | A query fails asking for an index | Composite index missing | `firebase deploy --only firestore:indexes`, or click the link in the error |
-| `npm run test:rules` hangs or fails to start | Java missing, or a stale emulator holding 8080 | Install a JDK. Then: `Get-NetTCPConnection -LocalPort 8080` and stop the process it names |
+| `npm run test:rules` cannot start on 8080 | Java missing, or the port is already occupied | Install a JDK 21. Do not stop an unknown process; use a temporary Firebase emulator config with a free port and set the same `FIRESTORE_EMULATOR_PORT` for the rules test |
 | Edits do not appear in the browser | An old Vite server on 5173 is serving stale code | Read the URL Vite printed; close the other server |
 | Camera does not work on a second device | Not a secure context | Use `npm run dev:lan` (HTTPS) — see [Video consultation](#video-consultation) |
-| Payment says "not configured" | No Razorpay keys — working as intended | See [Configuring the payment API](#configuring-the-payment-api) |
-| Payment returns HTTP 503 when recording | No service-account JSON | Set `GOOGLE_APPLICATION_CREDENTIALS` |
+| Demo payment does not persist | Firestore rules are outdated, or an older issued prescription is not linked to its consultation | Deploy the current Firestore rules; have its doctor open the prescription page to link the existing issued prescription |
 
 ---
 
@@ -418,15 +368,13 @@ The repository has no dependency on any one machine:
 
 - No absolute paths anywhere in the source. `api.py` resolves `model.pkl`
   relative to its own file; the frontend resolves everything through Vite.
-- No credentials in source control. Firebase config, Razorpay keys and the
-  Admin SDK path are all read from the environment, with `.env.example`
-  templates for each.
+- No credentials in source control. Firebase web config is set per
+  environment; demo payments use the signed-in Firebase client.
 - `model.pkl` is committed, so a fresh clone predicts without retraining —
   and `train_model.py` reproduces it exactly from the committed dataset.
 - Machine-specific files — `.env`, `scripts/seed.config.json`,
-  `cardiac_mobile/firebase.local.json`, service-account JSON, `venv/`,
-  `node_modules/`, `dist/` — are git-ignored, each with a committed
-  `.example` counterpart where one is useful.
+  `cardiac_mobile/firebase.local.json`, `venv/`, `node_modules/`, `dist/` —
+  are git-ignored, with examples where useful.
 
 ---
 
@@ -517,7 +465,6 @@ doctor accounts are provisioned by an administrator and cannot be signed up.
 | `care_links/{doctorUid}_{patientUid}` | Grants a doctor access to a patient | Doctor, on accept |
 | `video_rooms/{requestId}` | WebRTC signalling | Both participants |
 | `prescriptions/{id}` | Doctor's prescription | Doctor only |
-| `payments/{id}` | Payment record | Server only |
 
 Status values are always lowercase: `pending`, `accepted`, `rejected`,
 `cancelled`, `completed`. Ask the helpers in
@@ -555,12 +502,13 @@ emergency guidance regardless of the estimated band.
 
 The consultation fee is taken **after the doctor accepts and before the
 prescription is released**, not before the doctor has done anything. When a
-call ends, the patient lands on the payment page; the prescription unlocks
-once the server has verified the payment signature.
-
-If Razorpay is not configured, the payment page says so plainly rather than
-blocking the demo or faking success. `VITE_DEFAULT_CONSULTATION_FEE` supplies
-the fee when a doctor record has no `fee` field of its own.
+call ends, the patient lands on the payment page. The demo waits briefly, then
+stores `paymentStatus: "paid"` and `paymentMethod: "DEMO"` on the consultation
+and unlocks the prescription referenced by that consultation. The signed-in
+patient's Firebase client performs this update under Firestore rules; no
+gateway, backend payment route, or Admin SDK credential is required. The
+`VITE_DEFAULT_CONSULTATION_FEE` value supplies the fee when the doctor record
+has no `fee` of its own.
 
 ### care_links
 
@@ -585,13 +533,11 @@ npm run test:rules      # 76 tests, Firestore emulator
 - Prescriptions are doctor-write, patient-read
 - Payout destinations are unreadable by patients *and* doctors
 - Unknown collections are denied by default
-- **Clients can never mark a payment paid** — that requires an HMAC signature
-  verified by the server with a secret the browser never sees
+- Demo payment updates are limited to the signed-in patient's issued
+  consultation and its linked prescription, in one atomic batch
 
-Secrets live in environment variables and are git-ignored. The repository
-contains no API secret, no service-account key and no private key; see
-[Credentials each teammate needs](#credentials-each-teammate-needs) for what
-is secret and what only looks like it.
+Firebase web configuration is supplied per environment in a git-ignored
+`.env`. No payment gateway or Firebase Admin credential is needed.
 
 ---
 

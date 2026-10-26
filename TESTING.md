@@ -11,7 +11,7 @@ Status legend:
 ## 0. Start everything
 
 ```bash
-cd cardiac_ml && venv/Scripts/python -m uvicorn api:app --port 8000
+cd cardiac_ml && venv/Scripts/python -m uvicorn api:app --host 127.0.0.1 --port 8001
 ```
 ```bash
 cd cardiac && npm run dev
@@ -72,7 +72,7 @@ cd cardiac_ml && venv/Scripts/python train_model.py
 npm run test:rules
 ```
 
-**76 passed, 0 failed.** Covers:
+**99 passed, 0 failed.** Covers:
 
 - Patient cannot read another patient's profile, assessment, consultation or prescription
 - Patient cannot edit doctor or hospital records
@@ -96,16 +96,12 @@ npm run test:rules
 
 ---
 
-## 4. Payment signature — **Automated**
+## 4. Demo payment security — **Automated**
 
-| Check | Result |
-|---|---|
-| Genuine Razorpay signature accepted | ✅ |
-| Guessed signature rejected | ✅ |
-| Signature from wrong secret rejected | ✅ |
-| Replayed signature for a different payment rejected | ✅ |
-| Empty signature rejected | ✅ |
-| Constant-time comparison used | ✅ `hmac.compare_digest` |
+The Firestore rules test suite verifies that the patient can atomically mark
+their own issued consultation as `paid` with `paymentMethod: "DEMO"` and
+unlock only its linked prescription. Direct or cross-patient unlocks,
+clinical-content changes, and doctor edits to payment status are refused.
 
 ---
 
@@ -232,23 +228,23 @@ to the three dead routes.
 
 ---
 
-## 11. Payment — **Manual**, needs Razorpay test keys
+## 11. Local demo payment — **Manual**, no gateway or rules deployment
 
-```bash
-set RAZORPAY_KEY_ID=rzp_test_xxx
-set RAZORPAY_KEY_SECRET=xxx
-set GOOGLE_APPLICATION_CREDENTIALS=C:\path\to\serviceAccount.json
-```
-
-- [ ] Without keys, the app says payments are not configured (never fakes success)
-- [ ] `GET /payments/config` reports `configured: false` → `true` once set
-- [ ] Fee shown on the consultation card
-- [ ] Test card completes and the consultation flips to `paid`
-- [ ] Closing the widget leaves it unpaid, with no error
-- [ ] Paying twice is refused (HTTP 409)
-- [ ] Re-posting the same verification is idempotent
-- [ ] Tampering with the amount is refused (server checks against the consultation)
-- [ ] A forged signature is refused and the payment marked `failed`
+- [ ] Open the payment page from the signed-in patient's Consultation History
+- [ ] Confirm the ₹500 amount and **DEMO PAYMENT — No real money will be charged**
+- [ ] Select **Pay ₹500 & Unlock Prescription**; the button shows
+      “Processing demo payment...” briefly
+- [ ] The page reports **Payment Successful!**, a demo reference, and payment date/time
+- [ ] Select **Download Receipt**; confirm it includes the consultation
+      reference, doctor, ₹500, date/time, demo reference, and the
+      **DEMO RECEIPT — NOT A REAL FINANCIAL TRANSACTION** notice
+- [ ] Refresh in the same browser; the local PAID status remains
+- [ ] Consultation History shows **PAID · DEMO (this browser)**
+- [ ] Pay Later before paying; no local PAID status or receipt is created
+- [ ] The prescription page still enforces Firebase permissions. If its
+      record cannot be fetched, it explains that rather than fabricating one.
+- [ ] No Firestore payment write, gateway credentials, Firebase Admin
+      credentials, or rules deployment is needed for this local demo
 
 ---
 
